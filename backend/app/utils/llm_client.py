@@ -4,6 +4,7 @@ Supports OpenAI API, Anthropic API, Claude CLI, and Codex CLI
 """
 
 import json
+import os
 import re
 import subprocess
 from typing import Optional, Dict, Any, List
@@ -140,9 +141,64 @@ class LLMClient:
         if response_format:
             kwargs["response_format"] = response_format
 
+        # Reasoning models (DeepSeek-style) can spend the entire max_tokens
+        # budget on a hidden reasoning trace and then return empty `content`.
+        # Operators can disable thinking with LLM_REASONING_EFFORT=none.
+        reasoning_effort = os.environ.get('LLM_REASONING_EFFORT', '').strip()
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
+
         response = self.client.chat.completions.create(**kwargs)
-        content = response.choices[0].message.content
+        message = response.choices[0].message
+        content = (message.content or '').strip()
+        if not content:
+            # Some providers put the answer in `reasoning_content` when content
+            # is empty — use it rather than failing the whole generation.
+            content = (getattr(message, 'reasoning_content', '') or '').strip()
         return self._clean_content(content)
+
+    @staticmethod
+    def _extract_json(text: str) -> Optional[Any]:
+        """Best-effort extraction of the first JSON object/array in ``text``.
+
+        Tolerates prose / <think> wrappers and markdown fences around the JSON.
+        """
+        if not text:
+            return None
+        start = None
+        opener = ''
+        for i, ch in enumerate(text):
+            if ch in '{[':
+                start, opener = i, ch
+                break
+        if start is None:
+            return None
+        closer = '}' if opener == '{' else ']'
+        depth = 0
+        in_str = False
+        esc = False
+        for j in range(start, len(text)):
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == '\\':
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start : j + 1])
+                    except json.JSONDecodeError:
+                        return None
+        return None
 
     def _chat_anthropic(
         self,
@@ -312,4 +368,7 @@ class LLMClient:
         try:
             return json.loads(cleaned_response)
         except json.JSONDecodeError:
+            extracted = self._extract_json(cleaned_response)
+            if extracted is not None:
+                return extracted
             raise ValueError(f"Invalid JSON returned by LLM: {cleaned_response[:500]}")
