@@ -9,7 +9,7 @@ import warnings
 # Must be set before all other imports
 warnings.filterwarnings("ignore", message=".*resource_tracker.*")
 
-from flask import Flask, request, send_from_directory
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 from .config import Config
@@ -17,9 +17,9 @@ from .utils.logger import setup_logger, get_logger
 
 
 def create_app(config_class=Config):
-    """Flask application factory function"""
-    frontend_dist = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../frontend/dist'))
-    app = Flask(__name__, static_folder=frontend_dist if os.path.isdir(frontend_dist) else None)
+    """Flask application factory function (headless API — no frontend)."""
+    # Backend-only service: SlashMarketer owns the UI and calls this API.
+    app = Flask(__name__)
     app.config.from_object(config_class)
     
     # Set JSON encoding: ensure non-ASCII characters are displayed directly (instead of \uXXXX format)
@@ -49,6 +49,21 @@ def create_app(config_class=Config):
     if should_log_startup:
         logger.info("Simulation process cleanup registered")
     
+    # Auth gate: this is an internal integration surface. When MIROFISH_API_KEY
+    # is set, every /api/* request must present it as a Bearer token. /health is
+    # exempt so the platform health-check and load balancers work unauthenticated.
+    @app.before_request
+    def require_api_key():
+        path = request.path
+        if not path.startswith('/api/'):
+            return None
+        required = os.environ.get('MIROFISH_API_KEY', '')
+        if not required:
+            return None
+        if request.headers.get('Authorization', '') != f'Bearer {required}':
+            return jsonify({'error': 'Unauthorized'}), 401
+        return None
+
     # Request logging middleware
     @app.before_request
     def log_request():
@@ -71,32 +86,23 @@ def create_app(config_class=Config):
     # SlashMarketer Verify (System 2) compatibility contract.
     app.register_blueprint(compat_bp, url_prefix='/api/projects')
     
-    # Health check
+    # Health check (unauthenticated — used by the platform + SlashMarketer).
     @app.route('/health')
     def health():
-        return {'status': 'ok', 'service': 'MiroFish Backend'}
+        return {'status': 'ok', 'service': 'MiroFish Backend', 'mode': 'headless'}
 
-    @app.route('/', defaults={'path': ''})
-    @app.route('/<path:path>')
-    def serve_frontend(path):
-        if path.startswith('api/') or path == 'health':
-            return {'error': 'Not found'}, 404
+    # Service metadata.
+    @app.route('/')
+    def root():
+        return {
+            'service': 'MiroFish Backend',
+            'mode': 'headless',
+            'integration': 'SlashMarketer (Verify · System 2)',
+            'endpoints': ['/health', '/api/projects/*', '/api/graph/*', '/api/simulation/*', '/api/report/*'],
+        }
 
-        static_folder = app.static_folder
-        if not static_folder or not os.path.isdir(static_folder):
-            return {'error': 'Frontend not built'}, 404
-
-        if path:
-            asset_path = os.path.join(static_folder, path)
-            if os.path.isfile(asset_path):
-                return send_from_directory(static_folder, path)
-
-        return send_from_directory(static_folder, 'index.html')
-    
     if should_log_startup:
-        if app.static_folder:
-            logger.info(f"Serving frontend from: {app.static_folder}")
-        logger.info("MiroFish Backend started successfully")
-    
+        logger.info("MiroFish Backend started successfully (headless API)")
+
     return app
 
