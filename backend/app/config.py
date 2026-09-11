@@ -54,9 +54,12 @@ class Config:
     # Graph database config (KuzuDB - local embedded graph database)
     GRAPH_DB_PATH = os.environ.get('GRAPH_DB_PATH', os.path.join(os.path.dirname(__file__), '../data/graphdb'))
 
-    # File upload config
+    # File upload config (env-overridable so PaaS can point it at a volume)
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
-    UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), '../uploads')
+    UPLOAD_FOLDER = os.environ.get(
+        'UPLOAD_FOLDER',
+        os.path.join(os.path.dirname(__file__), '../uploads'),
+    )
     ALLOWED_EXTENSIONS = {'pdf', 'md', 'txt', 'markdown'}
 
     # Text processing config
@@ -65,7 +68,10 @@ class Config:
 
     # OASIS simulation config
     OASIS_DEFAULT_MAX_ROUNDS = int(os.environ.get('OASIS_DEFAULT_MAX_ROUNDS', '10'))
-    OASIS_SIMULATION_DATA_DIR = os.path.join(os.path.dirname(__file__), '../uploads/simulations')
+    OASIS_SIMULATION_DATA_DIR = os.environ.get(
+        'OASIS_SIMULATION_DATA_DIR',
+        os.path.join(os.path.dirname(__file__), '../uploads/simulations'),
+    )
 
     # OASIS platform available actions
     OASIS_TWITTER_ACTIONS = [
