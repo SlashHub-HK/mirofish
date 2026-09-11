@@ -39,7 +39,8 @@ from flask import Blueprint, jsonify, request
 compat_bp = Blueprint('compat', __name__)
 
 # ── Loopback base (same server, real pipeline endpoints) ──────────────────
-_PORT = int(os.environ.get('FLASK_PORT') or os.environ.get('PORT') or 5001)
+# Must mirror run.py's precedence (PORT wins on PaaS).
+_PORT = int(os.environ.get('PORT') or os.environ.get('FLASK_PORT') or 5001)
 _BASE = f'http://127.0.0.1:{_PORT}'
 _TIMEOUT = httpx.Timeout(connect=10.0, read=900.0, write=120.0, pool=10.0)
 

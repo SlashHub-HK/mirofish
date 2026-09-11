@@ -36,8 +36,10 @@ def main():
 
     # Get run configuration
     host = os.environ.get('FLASK_HOST', '0.0.0.0')
-    # Railway (and most PaaS) inject PORT; prefer an explicit FLASK_PORT when set.
-    port = int(os.environ.get('FLASK_PORT') or os.environ.get('PORT') or 5001)
+    # PaaS (Railway/Heroku) inject PORT and route to it — it must WIN over the
+    # image's default FLASK_PORT, otherwise the app binds 5001 and the platform
+    # returns 502. FLASK_PORT stays as the local-dev fallback.
+    port = int(os.environ.get('PORT') or os.environ.get('FLASK_PORT') or 5001)
     debug = Config.DEBUG
 
     # Start server
