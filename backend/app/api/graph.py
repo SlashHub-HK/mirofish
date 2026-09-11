@@ -191,7 +191,7 @@ def resume_project(project_id: str):
 
     # Load saved progress
     progress_file = os.path.join(
-        os.path.dirname(__file__), '..', 'uploads', 'tasks',
+        Config.TASKS_DIR,
         f"{task_id}_progress.json"
     )
     if not os.path.exists(progress_file):

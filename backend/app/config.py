@@ -60,6 +60,10 @@ class Config:
         'UPLOAD_FOLDER',
         os.path.join(os.path.dirname(__file__), '../uploads'),
     )
+    # Derived data dirs live under UPLOAD_FOLDER so a single volume keeps the
+    # knowledge graph, simulations, reports and async task files together.
+    REPORTS_DIR = os.environ.get('REPORTS_DIR', os.path.join(UPLOAD_FOLDER, 'reports'))
+    TASKS_DIR = os.environ.get('TASKS_DIR', os.path.join(UPLOAD_FOLDER, 'tasks'))
     ALLOWED_EXTENSIONS = {'pdf', 'md', 'txt', 'markdown'}
 
     # Text processing config
@@ -70,7 +74,7 @@ class Config:
     OASIS_DEFAULT_MAX_ROUNDS = int(os.environ.get('OASIS_DEFAULT_MAX_ROUNDS', '10'))
     OASIS_SIMULATION_DATA_DIR = os.environ.get(
         'OASIS_SIMULATION_DATA_DIR',
-        os.path.join(os.path.dirname(__file__), '../uploads/simulations'),
+        os.path.join(UPLOAD_FOLDER, 'simulations'),
     )
 
     # OASIS platform available actions

@@ -50,6 +50,10 @@ _PORT = int(os.environ.get('PORT') or os.environ.get('FLASK_PORT') or 5001)
 _BASE = f'http://127.0.0.1:{_PORT}'
 _TIMEOUT = httpx.Timeout(connect=10.0, read=900.0, write=120.0, pool=10.0)
 
+# Upper bound for an incoming seed document (a full campaign brief + product
+# context is well under this; guards memory + LLM token usage).
+MAX_SEED_CHARS = int(os.environ.get('COMPAT_MAX_SEED_CHARS', str(200_000)))
+
 _client_lock = threading.Lock()
 _client: httpx.Client | None = None
 
@@ -177,10 +181,13 @@ def _data(payload: dict) -> dict:
 def create_project():
     body = request.get_json(silent=True) or {}
     title = str(body.get('title') or 'MiroFish project').strip()[:200] or 'MiroFish project'
-    description = str(body.get('description') or '').strip()
+    description = str(body.get('description') or '').strip()[:2000]
     seed_text = str(body.get('seed_text') or '').strip()
     if not seed_text:
         seed_text = description or title
+    # Bound the payload so a huge seed can't exhaust memory or the LLM budget.
+    if len(seed_text) > MAX_SEED_CHARS:
+        seed_text = seed_text[:MAX_SEED_CHARS]
 
     files = {'files': ('seed.txt', seed_text.encode('utf-8'), 'text/plain')}
     form = {
@@ -237,6 +244,20 @@ def graph_status(pid: str):
 @compat_bp.route('/<pid>/simulation/prepare', methods=['POST'])
 def simulation_prepare(pid: str):
     sid = _get(pid).get('simulation_id')
+    if sid:
+        # The stored simulation may have been lost (e.g. created before the
+        # data dir moved onto the volume). Recreate it from the graph instead
+        # of failing forever.
+        try:
+            _call('GET', f'/api/simulation/{sid}')
+        except _UpstreamError as exc:
+            if exc.status == 404:
+                sid = None
+            else:
+                return _error(exc.status, str(exc))
+        except RuntimeError as exc:
+            return jsonify({'detail': str(exc)}), 502
+
     if not sid:
         try:
             payload = _call('POST', '/api/simulation/create', json_body={'project_id': pid})
@@ -317,24 +338,42 @@ def simulation_run(pid: str):
     if force:
         # Drop the previous run's report so the re-run regenerates fresh.
         _update(pid, report_task=None, report_id=None)
+    _update(pid, run_started_at=time.time())
     return jsonify(payload)
 
 
 @compat_bp.route('/<pid>/simulation/run/status', methods=['GET'])
 def simulation_run_status(pid: str):
-    sid = _get(pid).get('simulation_id')
+    entry = _get(pid)
+    sid = entry.get('simulation_id')
     if not sid:
         return jsonify({'status': 'running'})
     try:
         payload = _call('GET', f'/api/simulation/{sid}/run-status')
     except _UpstreamError as exc:
+        # A missing simulation (e.g. state lost) is a terminal failure, not a
+        # reason to poll forever.
+        if exc.status == 404:
+            return jsonify({'status': 'failed', 'error': 'simulation run state not found (re-simulate required)'})
         return _error(exc.status, str(exc))
     except RuntimeError as exc:
         return jsonify({'detail': str(exc)}), 502
     d = _data(payload)
-    out = {'status': _normalize(d.get('runner_status'))}
-    if 'progress_percent' in d:
-        out['progress'] = d.get('progress_percent')
+    runner = str(d.get('runner_status') or '').strip().lower()
+    # ``idle`` means upstream has no run state. Allow a short grace window for
+    # the just-started process to register before declaring failure.
+    started = float(entry.get('run_started_at') or 0)
+    if runner in ('', 'idle') and (not started or (time.time() - started) > 45.0):
+        return jsonify({'status': 'failed', 'error': 'simulation run state not found (re-simulate required)'})
+    out = {'status': 'running' if runner in ('', 'idle') else _normalize(runner)}
+    for src, dst in (
+        ('progress_percent', 'progress'),
+        ('current_round', 'round'),
+        ('total_rounds', 'total_rounds'),
+        ('total_actions_count', 'actions'),
+    ):
+        if d.get(src) is not None:
+            out[dst] = d.get(src)
     err = d.get('error') or d.get('message')
     if out['status'] == 'failed' and err:
         out['error'] = str(err)

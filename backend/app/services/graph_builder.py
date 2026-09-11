@@ -188,7 +188,7 @@ class GraphBuilderService:
                 # Save partial results for resume
                 import json
                 progress_file = os.path.join(
-                    os.path.dirname(__file__), '..', 'uploads', 'tasks',
+                    Config.TASKS_DIR,
                     f"{task_id}_progress.json"
                 )
                 with open(progress_file, 'w') as f:

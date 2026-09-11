@@ -122,11 +122,10 @@ class SimulationManager:
     4. Prepare all files needed by preset scripts
     """
     
-    # Simulation data storage directory
-    SIMULATION_DATA_DIR = os.path.join(
-        os.path.dirname(__file__), 
-        '../../uploads/simulations'
-    )
+    # Simulation data storage directory. Must honour the env override so the
+    # state survives container restarts: the default lives on the image's
+    # ephemeral filesystem, which wiped every simulation on each redeploy.
+    SIMULATION_DATA_DIR = Config.OASIS_SIMULATION_DATA_DIR
     
     def __init__(self):
         # Ensure directory exists

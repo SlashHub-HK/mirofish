@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 
 from .graph_db import GraphDatabase
 
+from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.llm_client import LLMClient
 
@@ -1496,10 +1497,7 @@ Return the sub-question list in JSON format."""
         import csv
 
         # Build profile file path
-        sim_dir = os.path.join(
-            os.path.dirname(__file__),
-            f'../../uploads/simulations/{simulation_id}'
-        )
+        sim_dir = os.path.join(Config.OASIS_SIMULATION_DATA_DIR, simulation_id)
 
         profiles = []
 

@@ -2,6 +2,7 @@
 MiroFish Backend - Flask Application Factory
 """
 
+import hmac
 import os
 import warnings
 
@@ -60,9 +61,16 @@ def create_app(config_class=Config):
         required = os.environ.get('MIROFISH_API_KEY', '')
         if not required:
             return None
-        if request.headers.get('Authorization', '') != f'Bearer {required}':
+        # Constant-time compare so a timing side-channel can't probe the key.
+        if not hmac.compare_digest(request.headers.get('Authorization', ''), f'Bearer {required}'):
             return jsonify({'error': 'Unauthorized'}), 401
         return None
+
+    if should_log_startup and not os.environ.get('MIROFISH_API_KEY', '').strip():
+        logger.warning(
+            'MIROFISH_API_KEY is not set — all /api/* endpoints are UNAUTHENTICATED. '
+            'Set it in production.'
+        )
 
     # Request logging middleware
     @app.before_request
