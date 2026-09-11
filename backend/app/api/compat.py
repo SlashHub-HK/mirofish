@@ -33,6 +33,7 @@ import threading
 import time
 from datetime import datetime
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 from flask import jsonify, request
@@ -451,3 +452,257 @@ def report_generate_status(pid: str):
     if d.get('report_id'):
         out['report_id'] = d.get('report_id')
     return jsonify(out)
+
+
+# ── Visualizer (read-only) ────────────────────────────────────────────────
+# SlashMarketer renders the full MiroFish experience (graph, agent process,
+# social feed, report) from these normalized, project-scoped reads. Ids are
+# resolved from state and cached so the UI never has to know graph/sim/report
+# identifiers.
+
+def _forward_query(allowed: tuple[str, ...]) -> str:
+    params = {k: request.args.get(k) for k in allowed if request.args.get(k)}
+    return f'?{urlencode(params)}' if params else ''
+
+
+def _resolve_graph_id(pid: str) -> str:
+    gid = str(_get(pid).get('graph_id') or '').strip()
+    if gid:
+        return gid
+    d = _data(_call('GET', f'/api/graph/project/{pid}'))
+    gid = str(d.get('graph_id') or '').strip()
+    if gid:
+        _update(pid, graph_id=gid)
+    return gid
+
+
+def _resolve_simulation_id(pid: str) -> str:
+    sid = str(_get(pid).get('simulation_id') or '').strip()
+    if sid:
+        return sid
+    payload = _call('GET', f'/api/simulation/list?project_id={pid}')
+    raw = payload.get('data')
+    sims = raw if isinstance(raw, list) else []
+    if sims:
+        sid = str(sims[0].get('simulation_id') or '').strip()
+        if sid:
+            _update(pid, simulation_id=sid, graph_id=sims[0].get('graph_id'))
+    return sid
+
+
+def _resolve_report_id(pid: str) -> str:
+    rid = str(_get(pid).get('report_id') or '').strip()
+    if rid:
+        return rid
+    sid = _resolve_simulation_id(pid)
+    if not sid:
+        return ''
+    d = _data(_call('GET', f'/api/report/by-simulation/{sid}'))
+    rid = str(d.get('report_id') or '').strip()
+    if rid:
+        _update(pid, report_id=rid)
+    return rid
+
+
+def _read(pid: str, path: str) -> dict:
+    """Read a loopback endpoint, mapping errors to a JSON-safe envelope."""
+    payload = _call('GET', path)
+    d = _data(payload)
+    return d if d else payload
+
+
+@compat_bp.route('/<pid>/overview', methods=['GET'])
+def overview(pid: str):
+    entry = _get(pid)
+    out: dict[str, Any] = {
+        'project_id': pid,
+        'title': entry.get('title'),
+        'created_at': entry.get('created_at'),
+        'graph_id': entry.get('graph_id'),
+        'simulation_id': entry.get('simulation_id'),
+        'report_id': entry.get('report_id'),
+        'node_count': 0,
+        'edge_count': 0,
+        'rounds': 0,
+        'actions': 0,
+        'agents': 0,
+        'started_at': None,
+        'completed_at': None,
+        'runner_status': None,
+        'has_report': bool(entry.get('report_id')),
+    }
+    try:
+        gid = _resolve_graph_id(pid)
+        if gid:
+            g = _data(_call('GET', f'/api/graph/data/{gid}'))
+            out['graph_id'] = gid
+            out['node_count'] = g.get('node_count', 0)
+            out['edge_count'] = g.get('edge_count', 0)
+    except (_UpstreamError, RuntimeError):
+        pass
+    try:
+        sid = _resolve_simulation_id(pid)
+        if sid:
+            st = _data(_call('GET', f'/api/simulation/{sid}/run-status'))
+            out['simulation_id'] = sid
+            out['rounds'] = st.get('current_round', 0)
+            out['total_rounds'] = st.get('total_rounds', 0)
+            out['actions'] = st.get('total_actions_count', 0)
+            out['started_at'] = st.get('started_at')
+            out['completed_at'] = st.get('completed_at')
+            out['runner_status'] = st.get('runner_status')
+            stats = _data(_call('GET', f'/api/simulation/{sid}/agent-stats'))
+            out['agents'] = stats.get('agents_count', 0)
+    except (_UpstreamError, RuntimeError):
+        pass
+    try:
+        rid = _resolve_report_id(pid)
+        if rid:
+            out['report_id'] = rid
+            out['has_report'] = True
+    except (_UpstreamError, RuntimeError):
+        pass
+    return jsonify(out)
+
+
+@compat_bp.route('/<pid>/graph', methods=['GET'])
+def graph_view(pid: str):
+    try:
+        gid = _resolve_graph_id(pid)
+        if not gid:
+            return jsonify({'graph_id': None, 'node_count': 0, 'edge_count': 0, 'nodes': [], 'edges': []})
+        d = _read(pid, f'/api/graph/data/{gid}')
+        d.setdefault('graph_id', gid)
+        d.setdefault('nodes', [])
+        d.setdefault('edges', [])
+        return jsonify(d)
+    except _UpstreamError as exc:
+        return _error(exc.status, str(exc))
+    except RuntimeError as exc:
+        return jsonify({'detail': str(exc)}), 502
+
+
+@compat_bp.route('/<pid>/entities', methods=['GET'])
+def entities_view(pid: str):
+    try:
+        gid = _resolve_graph_id(pid)
+        if not gid:
+            return jsonify({'entities': []})
+        d = _read(pid, f'/api/simulation/entities/{gid}{_forward_query(("enrich",))}')
+        d.setdefault('entities', [])
+        return jsonify(d)
+    except _UpstreamError as exc:
+        return _error(exc.status, str(exc))
+    except RuntimeError as exc:
+        return jsonify({'detail': str(exc)}), 502
+
+
+@compat_bp.route('/<pid>/actions', methods=['GET'])
+def actions_view(pid: str):
+    try:
+        sid = _resolve_simulation_id(pid)
+        if not sid:
+            return jsonify({'count': 0, 'actions': []})
+        d = _read(pid, f'/api/simulation/{sid}/actions{_forward_query(("limit", "offset", "platform", "round_num"))}')
+        d.setdefault('actions', [])
+        return jsonify(d)
+    except _UpstreamError as exc:
+        return _error(exc.status, str(exc))
+    except RuntimeError as exc:
+        return jsonify({'detail': str(exc)}), 502
+
+
+@compat_bp.route('/<pid>/timeline', methods=['GET'])
+def timeline_view(pid: str):
+    try:
+        sid = _resolve_simulation_id(pid)
+        if not sid:
+            return jsonify({'rounds_count': 0, 'timeline': []})
+        d = _read(pid, f'/api/simulation/{sid}/timeline{_forward_query(("start_round", "end_round"))}')
+        d.setdefault('timeline', [])
+        return jsonify(d)
+    except _UpstreamError as exc:
+        return _error(exc.status, str(exc))
+    except RuntimeError as exc:
+        return jsonify({'detail': str(exc)}), 502
+
+
+@compat_bp.route('/<pid>/agents', methods=['GET'])
+def agents_view(pid: str):
+    try:
+        sid = _resolve_simulation_id(pid)
+        if not sid:
+            return jsonify({'agents_count': 0, 'stats': []})
+        d = _read(pid, f'/api/simulation/{sid}/agent-stats')
+        d.setdefault('stats', [])
+        return jsonify(d)
+    except _UpstreamError as exc:
+        return _error(exc.status, str(exc))
+    except RuntimeError as exc:
+        return jsonify({'detail': str(exc)}), 502
+
+
+@compat_bp.route('/<pid>/posts', methods=['GET'])
+def posts_view(pid: str):
+    try:
+        sid = _resolve_simulation_id(pid)
+        if not sid:
+            return jsonify({'platform': 'reddit', 'count': 0, 'total': 0, 'posts': []})
+        d = _read(pid, f'/api/simulation/{sid}/posts{_forward_query(("platform", "limit", "offset"))}')
+        d.setdefault('posts', [])
+        return jsonify(d)
+    except _UpstreamError as exc:
+        return _error(exc.status, str(exc))
+    except RuntimeError as exc:
+        return jsonify({'detail': str(exc)}), 502
+
+
+@compat_bp.route('/<pid>/comments', methods=['GET'])
+def comments_view(pid: str):
+    try:
+        sid = _resolve_simulation_id(pid)
+        if not sid:
+            return jsonify({'count': 0, 'comments': []})
+        d = _read(pid, f'/api/simulation/{sid}/comments{_forward_query(("platform", "limit", "offset", "post_id"))}')
+        d.setdefault('comments', [])
+        return jsonify(d)
+    except _UpstreamError as exc:
+        return _error(exc.status, str(exc))
+    except RuntimeError as exc:
+        return jsonify({'detail': str(exc)}), 502
+
+
+@compat_bp.route('/<pid>/profiles', methods=['GET'])
+def profiles_view(pid: str):
+    try:
+        sid = _resolve_simulation_id(pid)
+        if not sid:
+            return jsonify({'platform': 'reddit', 'count': 0, 'profiles': []})
+        d = _read(pid, f'/api/simulation/{sid}/profiles{_forward_query(("platform",))}')
+        d.setdefault('profiles', [])
+        return jsonify(d)
+    except _UpstreamError as exc:
+        return _error(exc.status, str(exc))
+    except RuntimeError as exc:
+        return jsonify({'detail': str(exc)}), 502
+
+
+@compat_bp.route('/<pid>/report', methods=['GET'])
+def report_view(pid: str):
+    try:
+        rid = _resolve_report_id(pid)
+        if not rid:
+            return jsonify({'report_id': None, 'markdown_content': '', 'sections': []})
+        d = _read(pid, f'/api/report/{rid}')
+        d.setdefault('report_id', rid)
+        try:
+            sec = _data(_call('GET', f'/api/report/{rid}/sections'))
+            d['sections'] = sec.get('sections') or []
+            d['is_complete'] = sec.get('is_complete', True)
+        except (_UpstreamError, RuntimeError):
+            d.setdefault('sections', [])
+        return jsonify(d)
+    except _UpstreamError as exc:
+        return _error(exc.status, str(exc))
+    except RuntimeError as exc:
+        return jsonify({'detail': str(exc)}), 502
