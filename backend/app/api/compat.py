@@ -38,6 +38,22 @@ from flask import Blueprint, jsonify, request
 
 compat_bp = Blueprint('compat', __name__)
 
+
+@compat_bp.before_request
+def _require_api_key():
+    """Optional bearer gate for the SlashMarketer integration surface.
+
+    When ``MIROFISH_API_KEY`` is set, every /api/projects/* call must present
+    it. SlashMarketer's proxy already forwards the key as a Bearer token.
+    """
+    required = os.environ.get('MIROFISH_API_KEY', '')
+    if not required:
+        return None
+    auth = request.headers.get('Authorization', '')
+    if auth != f'Bearer {required}':
+        return jsonify({'detail': 'Unauthorized'}), 401
+    return None
+
 # ── Loopback base (same server, real pipeline endpoints) ──────────────────
 # Must mirror run.py's precedence (PORT wins on PaaS).
 _PORT = int(os.environ.get('PORT') or os.environ.get('FLASK_PORT') or 5001)
