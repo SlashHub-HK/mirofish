@@ -34,11 +34,15 @@ import time
 from typing import Any
 
 import httpx
-from flask import Blueprint, jsonify, request
+from flask import jsonify, request
+
+# Reuse the package-level blueprint (same pattern as graph/report/simulation);
+# defining a *new* Blueprint here would attach routes to an object that is never
+# registered by the app factory.
+from . import compat_bp  # noqa: E402
 
 # NOTE: auth is enforced globally in app/__init__.py (all /api/* require the
 # MIROFISH_API_KEY bearer when configured), so the compat layer itself is open.
-compat_bp = Blueprint('compat', __name__)
 
 # ── Loopback base (same server, real pipeline endpoints) ──────────────────
 # Must mirror run.py's precedence (PORT wins on PaaS).
