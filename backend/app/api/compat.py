@@ -50,19 +50,51 @@ _PORT = int(os.environ.get('PORT') or os.environ.get('FLASK_PORT') or 5001)
 _BASE = f'http://127.0.0.1:{_PORT}'
 _TIMEOUT = httpx.Timeout(connect=10.0, read=900.0, write=120.0, pool=10.0)
 
-# ── State (persisted on the data volume) ──────────────────────────────────
+_client_lock = threading.Lock()
+_client: httpx.Client | None = None
+
+
+def _client_get() -> httpx.Client:
+    """Process-wide pooled client for loopback calls.
+
+    The compat layer fans out several loopback requests per SlashMarketer poll
+    (2 arms × status + kick). Reusing connections removes a TCP handshake from
+    every hop instead of opening a fresh socket per ``httpx.request``.
+    """
+    global _client
+    if _client is None:
+        with _client_lock:
+            if _client is None:
+                _client = httpx.Client(
+                    timeout=_TIMEOUT,
+                    limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
+                )
+    return _client
+
+
+# ── State (persisted on the data volume, cached in memory) ────────────────
 _DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../data'))
 _STATE_FILE = os.path.join(_DATA_DIR, 'compat_projects.json')
 _lock = threading.Lock()
+_STATE: dict[str, dict[str, Any]] | None = None
 
 
 def _load_state() -> dict[str, dict[str, Any]]:
+    """Return the in-memory state, loading it from disk at most once.
+
+    Polling hammers the status routes; without this cache every GET would read
+    (and JSON-parse) the volume file. Only mutations persist.
+    """
+    global _STATE
+    if _STATE is not None:
+        return _STATE
     try:
         with open(_STATE_FILE, encoding='utf-8') as fh:
             data = json.load(fh)
-            return data if isinstance(data, dict) else {}
     except (FileNotFoundError, ValueError):
-        return {}
+        data = {}
+    _STATE = data if isinstance(data, dict) else {}
+    return _STATE
 
 
 def _save_state(state: dict[str, dict[str, Any]]) -> None:
@@ -78,13 +110,12 @@ def _update(pid: str, **fields: Any) -> None:
         state = _load_state()
         entry = state.setdefault(pid, {})
         entry.update(fields)
-        state[pid] = entry
         _save_state(state)
 
 
 def _get(pid: str) -> dict[str, Any]:
     with _lock:
-        return _load_state().get(pid, {})
+        return dict(_load_state().get(pid) or {})
 
 
 # ── Upstream helpers ──────────────────────────────────────────────────────
@@ -109,14 +140,13 @@ def _call(method: str, path: str, *, json_body: Any = None, files=None, data=Non
     if key:
         headers['Authorization'] = f'Bearer {key}'
     try:
-        resp = httpx.request(
+        resp = _client_get().request(
             method,
             f'{_BASE}{path}',
             json=json_body,
             files=files,
             data=data,
             headers=headers,
-            timeout=_TIMEOUT,
         )
     except httpx.RequestError as exc:
         raise RuntimeError(f'MiroFish loopback unreachable: {exc}') from exc
@@ -265,6 +295,9 @@ def simulation_run(pid: str):
         rounds = int(rounds) if rounds else None
     except (TypeError, ValueError):
         rounds = None
+    # ``force`` restarts an already-completed/stopped run so the same prepared
+    # environment can be re-simulated (SlashMarketer's "re-simulate").
+    force = bool(body.get('force'))
     try:
         payload = _call(
             'POST',
@@ -274,12 +307,16 @@ def simulation_run(pid: str):
                 'max_rounds': rounds,
                 'platform': 'parallel',
                 'enable_graph_memory_update': False,
+                'force': force,
             },
         )
     except _UpstreamError as exc:
         return _error(exc.status, str(exc))
     except RuntimeError as exc:
         return jsonify({'detail': str(exc)}), 502
+    if force:
+        # Drop the previous run's report so the re-run regenerates fresh.
+        _update(pid, report_task=None, report_id=None)
     return jsonify(payload)
 
 
@@ -309,8 +346,16 @@ def report_generate(pid: str):
     sid = _get(pid).get('simulation_id')
     if not sid:
         return jsonify({'detail': 'simulation not prepared'}), 409
+    body = request.get_json(silent=True) or {}
+    # Always start a fresh report: on a re-simulate the previous run's report
+    # must not be returned as "already generated".
+    force_regenerate = bool(body.get('force_regenerate', True))
     try:
-        payload = _call('POST', '/api/report/generate', json_body={'simulation_id': sid})
+        payload = _call(
+            'POST',
+            '/api/report/generate',
+            json_body={'simulation_id': sid, 'force_regenerate': force_regenerate},
+        )
     except _UpstreamError as exc:
         return _error(exc.status, str(exc))
     except RuntimeError as exc:
