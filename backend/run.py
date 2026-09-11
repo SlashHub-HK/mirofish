@@ -36,7 +36,8 @@ def main():
 
     # Get run configuration
     host = os.environ.get('FLASK_HOST', '0.0.0.0')
-    port = int(os.environ.get('FLASK_PORT', 5001))
+    # Railway (and most PaaS) inject PORT; prefer an explicit FLASK_PORT when set.
+    port = int(os.environ.get('FLASK_PORT') or os.environ.get('PORT') or 5001)
     debug = Config.DEBUG
 
     # Start server
