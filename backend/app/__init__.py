@@ -99,6 +99,7 @@ def create_app(config_class=Config):
             'mode': 'headless',
             'integration': 'SlashMarketer (Verify · System 2)',
             'endpoints': ['/health', '/api/projects/*', '/api/graph/*', '/api/simulation/*', '/api/report/*'],
+            'routes': sorted(str(r) for r in app.url_map.iter_rules() if str(r).startswith('/api/')),
         }
 
     if should_log_startup:
