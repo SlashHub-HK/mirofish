@@ -31,6 +31,7 @@ import json
 import os
 import threading
 import time
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -127,7 +128,16 @@ def _normalize(status: Any) -> str:
     s = str(status or '').strip().lower()
     if s in ('completed', 'complete', 'ready', 'done', 'finished', 'success', 'succeeded'):
         return 'done'
-    if s in ('failed', 'error', 'cancelled', 'canceled'):
+    if s in (
+        'failed',
+        'error',
+        'cancelled',
+        'canceled',
+        'stopped',
+        'stop',
+        'terminated',
+        'killed',
+    ):
         return 'failed'
     return 'running'
 
@@ -363,6 +373,15 @@ def simulation_run_status(pid: str):
     # ``idle`` means upstream has no run state. Allow a short grace window for
     # the just-started process to register before declaring failure.
     started = float(entry.get('run_started_at') or 0)
+    # If the returned state predates our run (a leftover from a previous run),
+    # don't trust it — wait for the fresh run to register.
+    if started and d.get('started_at'):
+        try:
+            upstream_started = datetime.fromisoformat(str(d['started_at'])).timestamp()
+            if upstream_started + 5 < started:
+                return jsonify({'status': 'running', 'progress': 0.0})
+        except (TypeError, ValueError):
+            pass
     if runner in ('', 'idle') and (not started or (time.time() - started) > 45.0):
         return jsonify({'status': 'failed', 'error': 'simulation run state not found (re-simulate required)'})
     out = {'status': 'running' if runner in ('', 'idle') else _normalize(runner)}
