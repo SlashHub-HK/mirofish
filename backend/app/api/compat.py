@@ -221,6 +221,30 @@ def _expand_seed(seed_text: str, requirement: str, target_entities: int) -> str:
 
 
 # ── Routes ────────────────────────────────────────────────────────────────
+@compat_bp.route('/expand', methods=['POST'])
+def expand_seed():
+    """Expand a short brief into a rich world dossier (no project created).
+
+    Lets a caller build ONE shared world for a fair A/B test (same population,
+    different scenario) instead of a different crowd per arm.
+    """
+    body = request.get_json(silent=True) or {}
+    requirement = str(body.get('description') or body.get('requirement') or '')[:2000]
+    seed_text = str(body.get('seed_text') or '')[:MAX_SEED_CHARS]
+    try:
+        target = int(body.get('target_entities') or 0)
+    except (TypeError, ValueError):
+        target = 0
+    if not seed_text:
+        seed_text = requirement
+    if target <= 1:
+        return jsonify({'seed_text': seed_text, 'expanded': False})
+    expanded = _expand_seed(seed_text, requirement, target)
+    if len(expanded) > MAX_SEED_CHARS:
+        expanded = expanded[:MAX_SEED_CHARS]
+    return jsonify({'seed_text': expanded, 'expanded': expanded != seed_text})
+
+
 @compat_bp.route('', methods=['POST'])
 @compat_bp.route('/', methods=['POST'])
 def create_project():
