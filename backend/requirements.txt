@@ -22,6 +22,9 @@ kuzu>=0.8.0
 # ============= OASIS Social Simulation =============
 camel-oasis==0.2.5
 camel-ai==0.2.78
+# camel-ai imports `from mcp.server import FastMCP`; mcp>=2 moved FastMCP out
+# of mcp.server, so pin the version the project's uv.lock resolved.
+mcp==1.24.0
 
 # ============= File Processing =============
 PyMuPDF>=1.24.0
