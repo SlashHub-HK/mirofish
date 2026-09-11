@@ -186,6 +186,40 @@ def _data(payload: dict) -> dict:
     return d if isinstance(d, dict) else {}
 
 
+def _expand_seed(seed_text: str, requirement: str, target_entities: int) -> str:
+    """Expand a short brief into a richer world dossier using MiroFish's LLM.
+
+    The agent population equals the number of entities extracted from the seed
+    (one profile per entity), so a thin seed yields only a handful of agents.
+    MiroFish is designed for full documents; this synthesizes one when the
+    caller asks for a bigger world. Best-effort — failures return the original.
+    """
+    try:
+        from ..utils.llm_client import LLMClient
+    except Exception:
+        return seed_text
+    target = max(10, min(int(target_entities or 0), 400))
+    prompt = (
+        'Build a realistic market-and-audience dossier for a social simulation.\n'
+        f'Scenario: {requirement}\n\n'
+        f'Known facts:\n{seed_text[:4000]}\n\n'
+        f'Write a factual, specific dossier (about {target * 12} words) that names roughly '
+        f'{target} DISTINCT entities, covering: consumer personas and segments, competitor '
+        f'brands, media outlets, journalists, influencers/creators, retail chains, community/NGO '
+        f'groups, regulators, events and hashtags. Use concrete names with one-line descriptions. '
+        f'Plain text, no markdown headings.'
+    )
+    messages = [
+        {'role': 'system', 'content': 'You write detailed, factual market research dossiers.'},
+        {'role': 'user', 'content': prompt},
+    ]
+    try:
+        text = (LLMClient().chat(messages=messages, temperature=0.7, max_tokens=min(4000, target * 16)) or '').strip()
+        return text or seed_text
+    except Exception:
+        return seed_text
+
+
 # ── Routes ────────────────────────────────────────────────────────────────
 @compat_bp.route('', methods=['POST'])
 @compat_bp.route('/', methods=['POST'])
@@ -196,6 +230,13 @@ def create_project():
     seed_text = str(body.get('seed_text') or '').strip()
     if not seed_text:
         seed_text = description or title
+    # Optional: synthesize a richer world so the simulation has many agents.
+    try:
+        target_entities = int(body.get('target_entities') or 0)
+    except (TypeError, ValueError):
+        target_entities = 0
+    if target_entities > 1:
+        seed_text = _expand_seed(seed_text, description or title, target_entities)
     # Bound the payload so a huge seed can't exhaust memory or the LLM budget.
     if len(seed_text) > MAX_SEED_CHARS:
         seed_text = seed_text[:MAX_SEED_CHARS]
