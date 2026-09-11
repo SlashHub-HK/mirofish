@@ -103,6 +103,11 @@ def _error(status: int, detail: str):
 
 def _call(method: str, path: str, *, json_body: Any = None, files=None, data=None):
     """Call the loopback pipeline. Returns (ok, payload)."""
+    # The app-level gate protects ALL /api/* — the loopback must authenticate too.
+    headers = {}
+    key = os.environ.get('MIROFISH_API_KEY', '')
+    if key:
+        headers['Authorization'] = f'Bearer {key}'
     try:
         resp = httpx.request(
             method,
@@ -110,6 +115,7 @@ def _call(method: str, path: str, *, json_body: Any = None, files=None, data=Non
             json=json_body,
             files=files,
             data=data,
+            headers=headers,
             timeout=_TIMEOUT,
         )
     except httpx.RequestError as exc:
