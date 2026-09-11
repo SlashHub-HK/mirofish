@@ -270,8 +270,17 @@ def simulation_prepare(pid: str):
             return jsonify({'detail': str(exc)}), 502
 
     if not sid:
+        # Mirror MiroFish's own UI: create the simulation bound to the built
+        # graph (the server also falls back to project.graph_id).
+        create_body: dict[str, Any] = {'project_id': pid}
         try:
-            payload = _call('POST', '/api/simulation/create', json_body={'project_id': pid})
+            gid = _resolve_graph_id(pid)
+            if gid:
+                create_body['graph_id'] = gid
+        except (_UpstreamError, RuntimeError):
+            pass
+        try:
+            payload = _call('POST', '/api/simulation/create', json_body=create_body)
         except _UpstreamError as exc:
             return _error(exc.status, str(exc))
         except RuntimeError as exc:
@@ -283,7 +292,16 @@ def simulation_prepare(pid: str):
         _update(pid, simulation_id=sid)
 
     try:
-        payload = _call('POST', '/api/simulation/prepare', json_body={'simulation_id': sid})
+        # use_llm_for_profiles / parallel_profile_count match the upstream UI.
+        payload = _call(
+            'POST',
+            '/api/simulation/prepare',
+            json_body={
+                'simulation_id': sid,
+                'use_llm_for_profiles': True,
+                'parallel_profile_count': 5,
+            },
+        )
     except _UpstreamError as exc:
         return _error(exc.status, str(exc))
     except RuntimeError as exc:
@@ -330,18 +348,22 @@ def simulation_run(pid: str):
     # ``force`` restarts an already-completed/stopped run so the same prepared
     # environment can be re-simulated (SlashMarketer's "re-simulate").
     force = bool(body.get('force'))
+    # MiroFish's own UI updates the knowledge graph with agent activity during
+    # the run; keep that on (env-overridable for safety).
+    graph_memory = os.environ.get('COMPAT_GRAPH_MEMORY_UPDATE', 'true').strip().lower() in ('1', 'true', 'yes')
+    start_body: dict[str, Any] = {
+        'simulation_id': sid,
+        'platform': 'parallel',
+        'enable_graph_memory_update': graph_memory,
+    }
+    # Only cap the horizon when a limit is explicitly requested; otherwise use
+    # MiroFish's auto-configured time config (total_simulation_hours).
+    if rounds:
+        start_body['max_rounds'] = rounds
+    if force:
+        start_body['force'] = True
     try:
-        payload = _call(
-            'POST',
-            '/api/simulation/start',
-            json_body={
-                'simulation_id': sid,
-                'max_rounds': rounds,
-                'platform': 'parallel',
-                'enable_graph_memory_update': False,
-                'force': force,
-            },
-        )
+        payload = _call('POST', '/api/simulation/start', json_body=start_body)
     except _UpstreamError as exc:
         return _error(exc.status, str(exc))
     except RuntimeError as exc:
@@ -703,3 +725,104 @@ def report_view(pid: str):
         return _error(exc.status, str(exc))
     except RuntimeError as exc:
         return jsonify({'detail': str(exc)}), 502
+
+
+# ── Interactive capabilities (interviews / report chat / stop) ────────────
+# MiroFish keeps the OASIS environment alive in command-waiting mode after a
+# run, so agents can be interviewed and the report agent can be chatted with.
+
+@compat_bp.route('/<pid>/interview', methods=['POST'])
+def interview(pid: str):
+    """Interview one agent (``agent_id``) or ask every agent (omit it)."""
+    sid = _resolve_simulation_id(pid)
+    if not sid:
+        return jsonify({'detail': 'simulation not prepared'}), 409
+    body = request.get_json(silent=True) or {}
+    prompt = str(body.get('prompt') or '').strip()
+    if not prompt:
+        return jsonify({'detail': 'prompt is required'}), 400
+    payload: dict[str, Any] = {'simulation_id': sid, 'prompt': prompt}
+    for key in ('platform', 'timeout'):
+        if body.get(key) not in (None, ''):
+            payload[key] = body[key]
+    agent_id = body.get('agent_id')
+    if agent_id is None:
+        endpoint = '/api/simulation/interview/all'
+    else:
+        endpoint = '/api/simulation/interview'
+        payload['agent_id'] = agent_id
+    try:
+        return jsonify(_call('POST', endpoint, json_body=payload))
+    except _UpstreamError as exc:
+        return _error(exc.status, str(exc))
+    except RuntimeError as exc:
+        return jsonify({'detail': str(exc)}), 502
+
+
+@compat_bp.route('/<pid>/interview/history', methods=['GET'])
+def interview_history(pid: str):
+    sid = _resolve_simulation_id(pid)
+    if not sid:
+        return jsonify({'interviews': []})
+    payload: dict[str, Any] = {'simulation_id': sid}
+    for key in ('platform', 'agent_id', 'limit'):
+        value = request.args.get(key)
+        if value:
+            payload[key] = value
+    try:
+        d = _data(_call('POST', '/api/simulation/interview/history', json_body=payload))
+        return jsonify(d)
+    except _UpstreamError as exc:
+        return _error(exc.status, str(exc))
+    except RuntimeError as exc:
+        return jsonify({'detail': str(exc)}), 502
+
+
+@compat_bp.route('/<pid>/report/chat', methods=['POST'])
+def report_chat(pid: str):
+    sid = _resolve_simulation_id(pid)
+    if not sid:
+        return jsonify({'detail': 'simulation not prepared'}), 409
+    body = request.get_json(silent=True) or {}
+    message = str(body.get('message') or '').strip()
+    if not message:
+        return jsonify({'detail': 'message is required'}), 400
+    history = body.get('chat_history') or []
+    try:
+        return jsonify(
+            _call(
+                'POST',
+                '/api/report/chat',
+                json_body={'simulation_id': sid, 'message': message, 'chat_history': history},
+            )
+        )
+    except _UpstreamError as exc:
+        return _error(exc.status, str(exc))
+    except RuntimeError as exc:
+        return jsonify({'detail': str(exc)}), 502
+
+
+@compat_bp.route('/<pid>/simulation/stop', methods=['POST'])
+def simulation_stop(pid: str):
+    sid = _get(pid).get('simulation_id')
+    if not sid:
+        return jsonify({'detail': 'simulation not prepared'}), 409
+    try:
+        return jsonify(_call('POST', '/api/simulation/stop', json_body={'simulation_id': sid}))
+    except _UpstreamError as exc:
+        return _error(exc.status, str(exc))
+    except RuntimeError as exc:
+        return jsonify({'detail': str(exc)}), 502
+
+
+@compat_bp.route('/<pid>/env-status', methods=['GET'])
+def env_status(pid: str):
+    sid = _get(pid).get('simulation_id')
+    if not sid:
+        return jsonify({'alive': False})
+    try:
+        payload = _call('POST', '/api/simulation/env-status', json_body={'simulation_id': sid})
+        d = _data(payload)
+        return jsonify({'alive': bool(d.get('alive') or d.get('is_alive')), 'detail': d})
+    except (_UpstreamError, RuntimeError):
+        return jsonify({'alive': False})
