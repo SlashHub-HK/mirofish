@@ -461,7 +461,7 @@ def report_generate_status(pid: str):
 # identifiers.
 
 def _forward_query(allowed: tuple[str, ...]) -> str:
-    params = {k: request.args.get(k) for k in allowed if request.args.get(k)}
+    params = {k: str(request.args.get(k))[:128] for k in allowed if request.args.get(k)}
     return f'?{urlencode(params)}' if params else ''
 
 
@@ -551,17 +551,14 @@ def overview(pid: str):
             out['started_at'] = st.get('started_at')
             out['completed_at'] = st.get('completed_at')
             out['runner_status'] = st.get('runner_status')
-            stats = _data(_call('GET', f'/api/simulation/{sid}/agent-stats'))
-            out['agents'] = stats.get('agents_count', 0)
     except (_UpstreamError, RuntimeError):
         pass
-    try:
-        rid = _resolve_report_id(pid)
-        if rid:
-            out['report_id'] = rid
-            out['has_report'] = True
-    except (_UpstreamError, RuntimeError):
-        pass
+    # Report presence is read from cached state only — resolving it upstream on
+    # every overview poll would add a call while no report exists yet.
+    rid = str(entry.get('report_id') or '').strip()
+    if rid:
+        out['report_id'] = rid
+        out['has_report'] = True
     return jsonify(out)
 
 
