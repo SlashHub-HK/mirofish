@@ -84,6 +84,11 @@ def create_app(config_class=Config):
     def log_response(response):
         logger = get_logger('mirofish.request')
         logger.debug(f"Response: {response.status_code}")
+        # Status endpoints are polled constantly; without an explicit no-store
+        # an edge/proxy (Railway) caches GETs and serves stale run/graph state.
+        if request.path.startswith('/api/') or request.path == '/health':
+            response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+            response.headers['Pragma'] = 'no-cache'
         return response
     
     # Register blueprints
