@@ -80,6 +80,11 @@ class Config:
     # Simulation subprocesses allowed at once. One: a run holds a full OASIS
     # agent stack (plus TWHIN-BERT for Twitter), which the host cannot duplicate.
     MAX_CONCURRENT_SIMULATIONS = int(os.environ.get('MAX_CONCURRENT_SIMULATIONS', '1'))
+    # Fallback agent/entity cap for callers that do not state a world size —
+    # including projects created before the request was persisted. One profile
+    # (and one agent per platform) is built per entity, so this is the ceiling
+    # that keeps a run inside the host. 0 disables the cap.
+    MIROFISH_DEFAULT_MAX_ENTITIES = int(os.environ.get('MIROFISH_DEFAULT_MAX_ENTITIES', '40'))
 
     # File upload config (env-overridable so PaaS can point it at a volume)
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB

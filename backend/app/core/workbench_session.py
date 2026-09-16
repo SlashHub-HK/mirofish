@@ -172,6 +172,7 @@ class WorkbenchSession:
         use_llm_for_profiles: bool = True,
         parallel_profile_count: int = 5,
         force_regenerate: bool = False,
+        max_entities: Optional[int] = None,
     ) -> Dict[str, Any]:
         result = self.prepare_simulation_tool.start(
             simulation_id=simulation_id,
@@ -179,6 +180,7 @@ class WorkbenchSession:
             use_llm_for_profiles=use_llm_for_profiles,
             parallel_profile_count=parallel_profile_count,
             force_regenerate=force_regenerate,
+            max_entities=max_entities,
             session_id=self.session_id,
         )
         self.state = self.session_manager.get(result["session_id"]) or self.state

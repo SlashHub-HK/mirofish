@@ -167,7 +167,8 @@ class KuzuEntityReader:
         self,
         graph_id: str,
         defined_entity_types: Optional[List[str]] = None,
-        enrich_with_edges: bool = True
+        enrich_with_edges: bool = True,
+        max_entities: Optional[int] = None,
     ) -> FilteredEntities:
         """
         Filter nodes matching predefined entity types.
@@ -180,6 +181,9 @@ class KuzuEntityReader:
             graph_id: Graph ID
             defined_entity_types: Predefined entity types (optional, filters to these if provided)
             enrich_with_edges: Whether to include related edge information
+            max_entities: Hard cap on returned entities (None = no cap). Also the
+                effective agent count, so it is the memory dial — pass the
+                caller's requested world size.
 
         Returns:
             FilteredEntities: Filtered entity collection
@@ -258,8 +262,26 @@ class KuzuEntityReader:
 
             filtered_entities.append(entity)
 
+        matched_count = len(filtered_entities)
+
+        # A HARD cap on how many entities become agents. `target_entities` used to
+        # be only a line in the expansion prompt ("name roughly N distinct
+        # entities"), so the model routinely overshot — a request for 40 produced
+        # 62 profiles / 64 nodes in production, and the run OOM-killed with
+        # `Process exit code: -9`. One profile is generated per entity and each
+        # platform holds an agent per entity, so the count is the memory dial;
+        # asking nicely is not a control. Deterministic (graph order) so a retry
+        # of the same run selects the same population.
+        if max_entities is not None and max_entities > 0 and matched_count > max_entities:
+            logger.info(
+                f"Capping entities at {max_entities} (graph matched {matched_count}); "
+                f"the rest are excluded from this simulation."
+            )
+            filtered_entities = filtered_entities[:max_entities]
+
         logger.info(f"Filtering complete: {total_count} total nodes, "
-                   f"{len(filtered_entities)} matched, types: {entity_types_found}")
+                   f"{matched_count} matched, {len(filtered_entities)} selected, "
+                   f"types: {entity_types_found}")
 
         return FilteredEntities(
             entities=filtered_entities,

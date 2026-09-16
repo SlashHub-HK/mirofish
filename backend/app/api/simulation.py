@@ -212,6 +212,12 @@ def prepare_simulation():
                 "error": "Please provide simulation_id"
             }), 400
 
+        raw_max = data.get('max_entities')
+        try:
+            max_entities = int(raw_max) if raw_max not in (None, '') else None
+        except (TypeError, ValueError):
+            max_entities = None
+
         session = WorkbenchSession.open(simulation_id=simulation_id, metadata={"entrypoint": "api.simulation.prepare"})
         result = session.start_simulation_preparation(
             simulation_id=simulation_id,
@@ -219,6 +225,7 @@ def prepare_simulation():
             use_llm_for_profiles=data.get('use_llm_for_profiles', True),
             parallel_profile_count=data.get('parallel_profile_count', 5),
             force_regenerate=data.get('force_regenerate', False),
+            max_entities=max_entities,
         )
 
         return jsonify({
@@ -998,12 +1005,19 @@ def generate_profiles():
         entity_types = data.get('entity_types')
         use_llm = data.get('use_llm', True)
         platform = data.get('platform', 'reddit')
+        # Optional hard cap on the entity/agent population (memory dial).
+        max_entities = data.get('max_entities')
+        try:
+            max_entities = int(max_entities) if max_entities not in (None, '') else None
+        except (TypeError, ValueError):
+            max_entities = None
         
         reader = KuzuEntityReader()
         filtered = reader.filter_defined_entities(
             graph_id=graph_id,
             defined_entity_types=entity_types,
-            enrich_with_edges=True
+            enrich_with_edges=True,
+            max_entities=max_entities,
         )
         
         if filtered.filtered_count == 0:

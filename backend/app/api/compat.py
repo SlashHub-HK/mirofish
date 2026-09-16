@@ -175,6 +175,7 @@ def _call(method: str, path: str, *, json_body: Any = None, files=None, data=Non
     return payload if isinstance(payload, dict) else {'data': payload}
 
 
+from ..config import Config
 from ..core.resource_guard import ResourceError
 
 
@@ -284,7 +285,16 @@ def create_project():
     project_id = str(d.get('project_id') or d.get('id') or '').strip()
     if not project_id:
         return jsonify({'detail': 'MiroFish did not return a project id'}), 502
-    _update(project_id, created_at=time.time(), title=title)
+    # Remember the REQUESTED world size. `_expand_seed` only *asks* the model for
+    # ~N entities, and the graph builder then extracts whatever it likes (40
+    # requested produced 64 nodes in production). The cap has to be enforced when
+    # the entity list is finalised, so it must survive from here to /prepare.
+    _update(
+        project_id,
+        created_at=time.time(),
+        title=title,
+        target_entities=max(0, target_entities),
+    )
     return jsonify({'project_id': project_id, 'stage': 'init', 'status': 'running'})
 
 
@@ -359,17 +369,25 @@ def simulation_prepare(pid: str):
             return jsonify({'detail': 'MiroFish did not return a simulation id'}), 502
         _update(pid, simulation_id=sid)
 
+    # Enforce the world size the caller asked for. Without this the population is
+    # whatever the graph happened to yield, which is both a broken promise to the
+    # caller and the direct cause of the OOM kills.
+    prepare_body: dict[str, Any] = {
+        'simulation_id': sid,
+        'use_llm_for_profiles': True,
+        'parallel_profile_count': 5,
+    }
+    requested = int((_get(pid).get('target_entities') or 0))
+    if requested <= 0:
+        # No recorded size (a project created before this was persisted, or a
+        # caller that never states one). Fall back to the configured ceiling
+        # rather than letting the graph decide — that is what OOM-killed runs.
+        requested = int(getattr(Config, 'MIROFISH_DEFAULT_MAX_ENTITIES', 0) or 0)
+    if requested > 0:
+        prepare_body['max_entities'] = requested
     try:
         # use_llm_for_profiles / parallel_profile_count match the upstream UI.
-        payload = _call(
-            'POST',
-            '/api/simulation/prepare',
-            json_body={
-                'simulation_id': sid,
-                'use_llm_for_profiles': True,
-                'parallel_profile_count': 5,
-            },
-        )
+        payload = _call('POST', '/api/simulation/prepare', json_body=prepare_body)
     except _UpstreamError as exc:
         return _error(exc.status, str(exc))
     except RuntimeError as exc:

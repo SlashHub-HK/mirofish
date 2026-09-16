@@ -255,7 +255,8 @@ class SimulationManager:
         defined_entity_types: Optional[List[str]] = None,
         use_llm_for_profiles: bool = True,
         progress_callback: Optional[callable] = None,
-        parallel_profile_count: int = 3
+        parallel_profile_count: int = 3,
+        max_entities: Optional[int] = None,
     ) -> SimulationState:
         """
         Prepare simulation environment (fully automated)
@@ -301,7 +302,11 @@ class SimulationManager:
             filtered = reader.filter_defined_entities(
                 graph_id=state.graph_id,
                 defined_entity_types=defined_entity_types,
-                enrich_with_edges=True
+                enrich_with_edges=True,
+                # The requested world size is a HARD cap, not a hint: one profile
+                # (and one agent per platform) is built per entity, so this is
+                # what actually bounds the run's memory.
+                max_entities=max_entities,
             )
             
             state.entities_count = filtered.filtered_count

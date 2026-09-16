@@ -334,6 +334,30 @@ class SimulationRunner:
             cls._run_states.pop(sim_id, None)
     
     @classmethod
+    def _last_error_line(cls, log_path: str) -> str:
+        """The last meaningful ERROR-ish line of a log, or ''.
+
+        Streams the file; the previous version read the whole thing and kept the
+        final 2000 characters, which is usually agent narrative rather than the
+        error, so the surfaced reason was unreadable.
+        """
+        last = ''
+        try:
+            if not os.path.exists(log_path):
+                return ''
+            with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+                for line in f:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    low = stripped.lower()
+                    if 'error' in low or 'exception' in low or 'traceback' in low:
+                        last = stripped
+        except OSError:
+            return ''
+        return last[-300:]
+
+    @classmethod
     def running_simulation_count(cls) -> int:
         """Simulations whose worker process is still alive.
 
@@ -565,20 +589,32 @@ class SimulationRunner:
                 state.runner_status = RunnerStatus.COMPLETED
                 state.completed_at = datetime.now().isoformat()
                 logger.info(f"Simulation completed: {simulation_id}")
+            elif state.runner_status == RunnerStatus.STOPPING or cls._cleanup_done:
+                # WE killed it — a stop request or process shutdown. Report that
+                # honestly instead of as a failure: a plain `exit code: -9` is
+                # just "something sent SIGKILL", and callers were reading every
+                # such kill as an out-of-memory event (chopping the round budget
+                # each retry for what was really a redeploy or a manual stop).
+                why = 'Engine shutting down' if cls._cleanup_done else 'Stopped'
+                state.runner_status = RunnerStatus.STOPPED
+                state.error = why
+                state.completed_at = datetime.now().isoformat()
+                logger.info(f"Simulation {why.lower()}: {simulation_id}")
             else:
                 state.runner_status = RunnerStatus.FAILED
-                # Read error information from main log file
-                main_log_path = os.path.join(sim_dir, "simulation.log")
-                error_info = ""
-                try:
-                    if os.path.exists(main_log_path):
-                        with open(main_log_path, 'r', encoding='utf-8') as f:
-                            error_info = f.read()[-2000:]  # Get last 2000 characters
-                except Exception:
-                    pass
-                state.error = f"Process exit code: {exit_code}, error: {error_info}"
+                # A concise reason. This used to append the last 2000 characters
+                # of the log, which is mostly agent prose — the "error" on a
+                # real failure was a wall of narrative text.
+                detail = cls._last_error_line(os.path.join(sim_dir, "simulation.log"))
+                killed = exit_code is not None and exit_code < 0
+                reason = (
+                    f'Process killed by signal (exit code: {exit_code})'
+                    if killed
+                    else f'Process exit code: {exit_code}'
+                )
+                state.error = f'{reason}{f": {detail}" if detail else ""}'
                 logger.error(f"Simulation failed: {simulation_id}, error={state.error}")
-            
+
             state.twitter_running = False
             state.reddit_running = False
             cls._save_run_state(state)
