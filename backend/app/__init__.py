@@ -20,7 +20,11 @@ from .utils.logger import setup_logger, get_logger
 def _capacity_snapshot() -> dict:
     """Best-effort memory/concurrency state. Never raises."""
     try:
-        from .core.resource_guard import available_memory_mb, heavy_stages_active
+        from .core.resource_guard import (
+            available_memory_mb,
+            heavy_stages_active,
+            heavy_stages_waiting,
+        )
         from .services.graph_db import open_database_count
         from .services.simulation_runner import SimulationRunner
 
@@ -28,6 +32,7 @@ def _capacity_snapshot() -> dict:
             'available_mb': available_memory_mb(),
             'min_free_mb': Config.MIROFISH_MIN_FREE_MB,
             'heavy_stages_active': heavy_stages_active(),
+            'heavy_stages_waiting': heavy_stages_waiting(),
             'max_heavy_stages': Config.MAX_CONCURRENT_HEAVY_STAGES,
             'running_simulations': SimulationRunner.running_simulation_count(),
             'max_simulations': Config.MAX_CONCURRENT_SIMULATIONS,

@@ -149,8 +149,30 @@ class SimulationManager:
         
         with open(state_file, 'w', encoding='utf-8') as f:
             json.dump(state.to_dict(), f, ensure_ascii=False, indent=2)
-        
+
         self._simulations[state.simulation_id] = state
+        self._evict_finished_states()
+
+    # Terminal states are kept so a late status poll still resolves, but they
+    # used to accumulate one entry per simulation for the life of the process —
+    # and every `SimulationStore()` gets its own map, so it multiplied. Keep a
+    # bounded tail and never evict a run that could still be in flight.
+    _FINISHED_STATES_MAX = 50
+    _TERMINAL_STATUSES = frozenset(
+        {SimulationStatus.STOPPED, SimulationStatus.COMPLETED, SimulationStatus.FAILED}
+    )
+
+    def _evict_finished_states(self) -> None:
+        if len(self._simulations) <= self._FINISHED_STATES_MAX:
+            return
+        excess = len(self._simulations) - self._FINISHED_STATES_MAX
+        finished = [
+            sim_id
+            for sim_id, state in self._simulations.items()
+            if state.status in self._TERMINAL_STATUSES
+        ]
+        for sim_id in finished[:excess]:
+            self._simulations.pop(sim_id, None)
     
     def _load_simulation_state(self, simulation_id: str) -> Optional[SimulationState]:
         """Load simulation state from file"""

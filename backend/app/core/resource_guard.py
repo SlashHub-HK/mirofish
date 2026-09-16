@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from contextlib import contextmanager
 from typing import Iterator, Optional
 
@@ -152,6 +153,7 @@ def assert_memory_available(stage: str) -> None:
 # ── Process-wide gate for the heavy stages ──────────────────────────
 _HEAVY_LOCK = threading.Lock()
 _heavy_active = 0
+_heavy_waiting = 0
 _HEAVY_COND = threading.Condition(_HEAVY_LOCK)
 
 
@@ -159,26 +161,43 @@ def _heavy_limit() -> int:
     return max(1, int(getattr(Config, 'MAX_CONCURRENT_HEAVY_STAGES', 1) or 1))
 
 
+def _heavy_wait_seconds() -> float:
+    try:
+        return max(0.0, float(getattr(Config, 'MAX_HEAVY_STAGE_WAIT_SECONDS', 180) or 0))
+    except (TypeError, ValueError):
+        return 180.0
+
+
 @contextmanager
 def heavy_stage(stage: str) -> Iterator[None]:
     """Serialise the memory-heavy stages across this process.
 
-    Deliberately a *blocking* gate rather than a refusal: a second Verity run
-    should wait its turn, not fail. The acquire has no timeout because the
-    engine's own request timeouts bound the caller side.
+    Waits a BOUNDED time for a slot, then refuses. An unbounded wait looks
+    friendlier but is worse under load: on a multi-user host the waiters pile up
+    holding their request threads and their partially-built state, so one slow
+    run converts into an outage. Failing fast with a retryable 503 lets the
+    caller back off instead — and SlashMarketer already treats 503 as transient,
+    so it retries on its own.
     """
-    global _heavy_active
+    global _heavy_active, _heavy_waiting
     limit = _heavy_limit()
+    wait_for = _heavy_wait_seconds()
+    deadline = time.monotonic() + wait_for
     with _HEAVY_COND:
-        waited = 0
-        while _heavy_active >= limit:
-            _HEAVY_COND.wait(timeout=1.0)
-            waited += 1
-            if waited == 30:  # ~30s — say something rather than look hung
-                logger.info(
-                    f'{stage}: waiting for a heavy-stage slot '
-                    f'({_heavy_active}/{limit} in use)'
-                )
+        if _heavy_active >= limit:
+            _heavy_waiting += 1
+            try:
+                while _heavy_active >= limit:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ResourceError(
+                            f'The simulation engine is busy: another {stage} stage '
+                            f'is still running (limit {limit}). Please retry in a '
+                            f'moment.'
+                        )
+                    _HEAVY_COND.wait(timeout=min(1.0, remaining))
+            finally:
+                _heavy_waiting -= 1
         _heavy_active += 1
     try:
         yield
@@ -192,6 +211,12 @@ def heavy_stages_active() -> int:
     """Current in-flight heavy stages (for /health and diagnostics)."""
     with _HEAVY_LOCK:
         return _heavy_active
+
+
+def heavy_stages_waiting() -> int:
+    """Callers queued for a heavy-stage slot — the backlog signal."""
+    with _HEAVY_LOCK:
+        return _heavy_waiting
 
 
 def assert_simulation_slot(running: int) -> None:

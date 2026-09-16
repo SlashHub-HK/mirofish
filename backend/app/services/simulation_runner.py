@@ -8,6 +8,7 @@ import sys
 import json
 import time
 import asyncio
+import heapq
 import threading
 import subprocess
 import signal
@@ -863,6 +864,76 @@ class SimulationRunner:
         return state
     
     @classmethod
+    def _stream_action_tail(
+        cls,
+        file_path: str,
+        *,
+        keep: int,
+        default_platform: Optional[str] = None,
+        platform_filter: Optional[str] = None,
+        agent_id: Optional[int] = None,
+        round_num: Optional[int] = None,
+    ) -> List[AgentAction]:
+        """The newest `keep` matching actions in a file, without loading it all.
+
+        `_read_actions_from_file` builds an `AgentAction` for EVERY record in the
+        log, and the actions endpoint is polled — so each page (and each poll,
+        every 15s while a run is live) paid full-history cost in time and memory.
+        Pagination only ever needs the newest `offset+limit` entries.
+
+        "Newest" is by **timestamp**, not by file position: the read and the
+        order the caller sorts by must agree, and relying on the log being
+        append-ordered would silently return the wrong page if it ever were not.
+        A bounded min-heap of the `keep` largest timestamps gives exactly the
+        top of the sorted list for any file order. Same filters and same record
+        validation as the full reader.
+        """
+        if keep <= 0 or not os.path.exists(file_path):
+            return []
+        # (timestamp, seq, action) — `seq` keeps tuples comparable without ever
+        # comparing AgentAction objects.
+        heap: List[tuple[str, int, AgentAction]] = []
+        seq = 0
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if '"agent_id"' not in line:
+                    continue  # cheap reject before parsing a JSON object
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if 'event_type' in data or 'agent_id' not in data:
+                    continue
+                record_platform = data.get('platform') or default_platform or ''
+                if platform_filter and record_platform != platform_filter:
+                    continue
+                if agent_id is not None and data.get('agent_id') != agent_id:
+                    continue
+                if round_num is not None and data.get('round') != round_num:
+                    continue
+                action = AgentAction(
+                    round_num=data.get('round', 0),
+                    timestamp=data.get('timestamp', ''),
+                    platform=record_platform,
+                    agent_id=data.get('agent_id', 0),
+                    agent_name=data.get('agent_name', ''),
+                    action_type=data.get('action_type', ''),
+                    action_args=data.get('action_args', {}),
+                    result=data.get('result'),
+                    success=data.get('success', True),
+                )
+                seq += 1
+                item = (action.timestamp, seq, action)
+                if len(heap) < keep:
+                    heapq.heappush(heap, item)
+                elif item[0] > heap[0][0]:
+                    heapq.heapreplace(heap, item)
+        return [action for _ts, _seq, action in heap]
+
+    @classmethod
     def _read_actions_from_file(
         cls,
         file_path: str,
@@ -1016,15 +1087,52 @@ class SimulationRunner:
         Returns:
             Action list
         """
-        actions = cls.get_all_actions(
-            simulation_id=simulation_id,
-            platform=platform,
-            agent_id=agent_id,
-            round_num=round_num
-        )
-        
-        # Paginate
-        return actions[offset:offset + limit]
+        # Bounded read: pagination needs only the newest `offset + limit` entries
+        # per platform, so we never materialise the whole history. The merged top
+        # N must come from the union of each platform's top N, so keeping that
+        # many from each side is sufficient (and exact).
+        keep = max(0, int(limit)) + max(0, int(offset))
+        if keep <= 0:
+            return []
+        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
+        actions: List[AgentAction] = []
+        from_twitter = not platform or platform == "twitter"
+        from_reddit = not platform or platform == "reddit"
+        if from_twitter:
+            actions.extend(
+                cls._stream_action_tail(
+                    os.path.join(sim_dir, "twitter", "actions.jsonl"),
+                    keep=keep,
+                    default_platform="twitter",
+                    platform_filter=platform,
+                    agent_id=agent_id,
+                    round_num=round_num,
+                )
+            )
+        if from_reddit:
+            actions.extend(
+                cls._stream_action_tail(
+                    os.path.join(sim_dir, "reddit", "actions.jsonl"),
+                    keep=keep,
+                    default_platform="reddit",
+                    platform_filter=platform,
+                    agent_id=agent_id,
+                    round_num=round_num,
+                )
+            )
+        if not actions:
+            # Legacy single-file layout.
+            actions = cls._stream_action_tail(
+                os.path.join(sim_dir, "actions.jsonl"),
+                keep=keep,
+                default_platform=None,
+                platform_filter=platform,
+                agent_id=agent_id,
+                round_num=round_num,
+            )
+
+        actions.sort(key=lambda a: a.timestamp, reverse=True)
+        return actions[offset : offset + limit]
     
     @classmethod
     def get_timeline(

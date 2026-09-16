@@ -73,6 +73,10 @@ class Config:
     MIROFISH_MIN_FREE_MB = int(os.environ.get('MIROFISH_MIN_FREE_MB', '800'))
     # In-process heavy stages (prepare/report) allowed at once.
     MAX_CONCURRENT_HEAVY_STAGES = int(os.environ.get('MAX_CONCURRENT_HEAVY_STAGES', '1'))
+    # How long a queued heavy stage waits for a slot before refusing with a
+    # retryable 503. Bounded on purpose: unbounded waiting piles up request
+    # threads and half-built state, turning one slow run into an outage.
+    MAX_HEAVY_STAGE_WAIT_SECONDS = int(os.environ.get('MAX_HEAVY_STAGE_WAIT_SECONDS', '180'))
     # Simulation subprocesses allowed at once. One: a run holds a full OASIS
     # agent stack (plus TWHIN-BERT for Twitter), which the host cannot duplicate.
     MAX_CONCURRENT_SIMULATIONS = int(os.environ.get('MAX_CONCURRENT_SIMULATIONS', '1'))

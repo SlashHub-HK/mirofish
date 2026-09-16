@@ -419,9 +419,21 @@ def simulation_run(pid: str):
     # MiroFish's own UI updates the knowledge graph with agent activity during
     # the run; keep that on (env-overridable for safety).
     graph_memory = os.environ.get('COMPAT_GRAPH_MEMORY_UPDATE', 'true').strip().lower() in ('1', 'true', 'yes')
+    # `parallel` runs both OASIS platforms in ONE subprocess, so peak memory is
+    # roughly the sum of both (~2x). `twitter` or `reddit` run a single platform;
+    # because the runner serialises them, that trades wall-clock for peak memory.
+    # Default stays `parallel` (unchanged behaviour) — this is the dial for a
+    # constrained host, and the choice is logged so it is never a silent change.
+    sim_platform = os.environ.get('MIROFISH_SIM_PLATFORM', 'parallel').strip().lower()
+    if sim_platform not in ('parallel', 'twitter', 'reddit'):
+        logger.warning(
+            f"MIROFISH_SIM_PLATFORM={sim_platform!r} is not one of "
+            f"parallel/twitter/reddit — falling back to 'parallel'"
+        )
+        sim_platform = 'parallel'
     start_body: dict[str, Any] = {
         'simulation_id': sid,
-        'platform': 'parallel',
+        'platform': sim_platform,
         'enable_graph_memory_update': graph_memory,
     }
     # Only cap the horizon when a limit is explicitly requested; otherwise use
