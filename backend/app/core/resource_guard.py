@@ -34,10 +34,68 @@ logger = get_logger('mirofish.resource_guard')
 # without swapping. `MemFree` is misleadingly small because of page cache, so we
 # deliberately do not use it.
 _MEMINFO_PATH = '/proc/meminfo'
+# Containers cap memory with a cgroup, and the host's MemAvailable does NOT
+# reflect that limit — the same oversight that makes Kuzu's own default unsafe.
+# cgroup v2 first (what modern Docker / Railway use), then v1.
+_CGROUP_V2_MAX = '/sys/fs/cgroup/memory.max'
+_CGROUP_V2_CURRENT = '/sys/fs/cgroup/memory.current'
+_CGROUP_V1_MAX = '/sys/fs/cgroup/memory/memory.limit_in_bytes'
+_CGROUP_V1_CURRENT = '/sys/fs/cgroup/memory/memory.usage_in_bytes'
+# cgroup v1 reports "unlimited" as a sentinel value near 2**63.
+_CGROUP_UNLIMITED = 1 << 62
+
+
+def _read_int(path: str) -> Optional[int]:
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            raw = f.read().strip()
+    except OSError:
+        return None
+    if not raw or raw == 'max':
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def cgroup_headroom_mb() -> Optional[int]:
+    """Memory headroom inside the container's own limit, or None if unlimited.
+
+    On a shared host this is the figure that actually matters: the kernel kills
+    us at the cgroup limit no matter how much the host has free.
+    """
+    for max_path, current_path in (
+        (_CGROUP_V2_MAX, _CGROUP_V2_CURRENT),
+        (_CGROUP_V1_MAX, _CGROUP_V1_CURRENT),
+    ):
+        limit = _read_int(max_path)
+        if limit is None or limit <= 0 or limit > _CGROUP_UNLIMITED:
+            continue
+        used = _read_int(current_path) or 0
+        return max(0, (limit - used) // (1024 * 1024))
+    return None
 
 
 def available_memory_mb() -> Optional[int]:
-    """Best-effort available physical memory in MB, or None if unknown."""
+    """Best-effort memory available to THIS process in MB, or None if unknown.
+
+    The smaller of the host's `MemAvailable` and the container's cgroup
+    headroom. Reading only the host figure — which is what this did first —
+    makes the preflight useless on a shared Railway host: it would happily start
+    a run sized against the whole machine.
+    """
+    host = _host_available_mb()
+    cgroup = cgroup_headroom_mb()
+    if host is None:
+        return cgroup
+    if cgroup is None:
+        return host
+    return min(host, cgroup)
+
+
+def _host_available_mb() -> Optional[int]:
+    """Host-wide `MemAvailable` in MB, or None when it cannot be read."""
     try:
         with open(_MEMINFO_PATH, 'r', encoding='utf-8') as f:
             for line in f:
