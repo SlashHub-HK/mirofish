@@ -9,6 +9,7 @@ jobs, and report generation can survive process restarts.
 import json
 import os
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -16,6 +17,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from ..config import Config
+from ..utils.logger import get_logger
 
 
 class TaskStatus(str, Enum):
@@ -79,6 +81,9 @@ class Task:
         )
 
 
+logger = get_logger('mirofish.task_manager')
+
+
 class TaskManager:
     """Thread-safe persistent task status manager."""
 
@@ -94,6 +99,8 @@ class TaskManager:
                     cls._instance = super().__new__(cls)
                     cls._instance._tasks = {}
                     cls._instance._task_lock = threading.Lock()
+                    # Timestamp of the last opportunistic prune (see create_task).
+                    cls._instance._last_prune = 0.0
                     cls._instance._ensure_storage_dir()
         return cls._instance
 
@@ -133,7 +140,24 @@ class TaskManager:
         with self._task_lock:
             self._tasks[task_id] = task
             self._persist_task(task)
+        self._prune_old_tasks_if_due()
         return task_id
+
+    # `cleanup_old_tasks()` existed but was never called from anywhere, so every
+    # completed task's result and JSON file were retained for the life of the
+    # process (and on disk forever). Prune opportunistically on the write path,
+    # at most hourly, instead of standing up a scheduler.
+    _PRUNE_INTERVAL_SECONDS = 3600
+
+    def _prune_old_tasks_if_due(self) -> None:
+        now = time.time()
+        if now - self._last_prune < self._PRUNE_INTERVAL_SECONDS:
+            return
+        self._last_prune = now
+        try:
+            self.cleanup_old_tasks()
+        except Exception as exc:  # noqa: BLE001 - pruning must never break task creation
+            logger.warning(f"Task cleanup failed (non-fatal): {exc}")
 
     def get_task(self, task_id: str) -> Optional[Task]:
         with self._task_lock:

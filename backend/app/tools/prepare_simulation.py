@@ -11,6 +11,7 @@ from ..resources.projects import ProjectStore
 from ..resources.simulations import SimulationStore
 from ..services.kuzu_entity_reader import KuzuEntityReader
 from ..services.simulation_manager import SimulationStatus
+from ..core.resource_guard import assert_memory_available, heavy_stage
 from ..utils.logger import get_logger
 from .simulation_support import check_simulation_prepared
 
@@ -174,15 +175,20 @@ class PrepareSimulationTool:
                         progress_detail=progress_detail_data,
                     )
 
-                result_state = self.simulation_store.prepare(
-                    simulation_id=simulation_id,
-                    simulation_requirement=simulation_requirement,
-                    document_text=document_text,
-                    defined_entity_types=entity_types,
-                    use_llm_for_profiles=use_llm_for_profiles,
-                    progress_callback=progress_callback,
-                    parallel_profile_count=parallel_profile_count,
-                )
+                # Preparing builds a persona per entity in-process; keep only
+                # one such stage running at a time on this shared host, and
+                # refuse outright when there is no memory headroom.
+                assert_memory_available('simulation preparation')
+                with heavy_stage('simulation preparation'):
+                    result_state = self.simulation_store.prepare(
+                        simulation_id=simulation_id,
+                        simulation_requirement=simulation_requirement,
+                        document_text=document_text,
+                        defined_entity_types=entity_types,
+                        use_llm_for_profiles=use_llm_for_profiles,
+                        progress_callback=progress_callback,
+                        parallel_profile_count=parallel_profile_count,
+                    )
 
                 self.session_manager.attach(session.session_id, metadata={"phase": "simulation_ready"})
                 self.task_manager.complete_task(task_id, result=result_state.to_simple_dict())

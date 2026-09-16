@@ -305,7 +305,50 @@ class SimulationRunner:
             json.dump(data, f, ensure_ascii=False, indent=2)
         
         cls._run_states[state.simulation_id] = state
+        cls._evict_finished_run_states()
+
+    # Finished run states are kept so a late poll can still read the outcome, but
+    # they were previously retained for the life of the process — one entry (with
+    # its recent_actions) per run, forever. Keep a bounded tail and never evict a
+    # run that is still going, which is the only thing the API is polling.
+    _FINISHED_RUN_STATES_MAX = 50
+
+    @classmethod
+    def _evict_finished_run_states(cls) -> None:
+        if len(cls._run_states) <= cls._FINISHED_RUN_STATES_MAX:
+            return
+        terminal = {
+            RunnerStatus.STOPPED,
+            RunnerStatus.COMPLETED,
+            RunnerStatus.FAILED,
+        }
+        finished = [
+            sim_id
+            for sim_id, state in cls._run_states.items()
+            if state.runner_status in terminal
+        ]
+        # Oldest first (dicts preserve insertion order) until we are back in budget.
+        excess = len(cls._run_states) - cls._FINISHED_RUN_STATES_MAX
+        for sim_id in finished[:excess]:
+            cls._run_states.pop(sim_id, None)
     
+    @classmethod
+    def running_simulation_count(cls) -> int:
+        """Simulations whose worker process is still alive.
+
+        Counted from `_processes` (the live registry) rather than a counter, so
+        a crashed/cleaned-up run cannot leave the figure inflated and block new
+        work forever.
+        """
+        alive = 0
+        for process in list(cls._processes.values()):
+            try:
+                if process.poll() is None:
+                    alive += 1
+            except Exception:  # noqa: BLE001 - a broken handle is not a live run
+                continue
+        return alive
+
     @classmethod
     def start_simulation(
         cls,
@@ -558,7 +601,12 @@ class SimulationRunner:
             # Clean up process resources
             cls._processes.pop(simulation_id, None)
             cls._action_queues.pop(simulation_id, None)
-            
+
+            # Drop the monitor-thread entry too. It was never popped, so every
+            # run leaked a Thread object (plus its frame) for the life of the
+            # process — one of the reasons memory grew steadily across runs.
+            cls._monitor_threads.pop(simulation_id, None)
+
             # Close log file handles
             if simulation_id in cls._stdout_files:
                 try:
@@ -1203,6 +1251,11 @@ class SimulationRunner:
         except Exception as e:
             logger.error(f"Failed to stop graph memory updaters: {e}")
         cls._graph_memory_enabled.clear()
+
+        # Release the per-run registries as well: without this a shutdown left
+        # run states and thread handles resident.
+        cls._monitor_threads.clear()
+        cls._run_states.clear()
 
         # Copy dict to avoid modification during iteration
         processes = list(cls._processes.items())

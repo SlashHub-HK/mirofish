@@ -175,6 +175,9 @@ def _call(method: str, path: str, *, json_body: Any = None, files=None, data=Non
     return payload if isinstance(payload, dict) else {'data': payload}
 
 
+from ..core.resource_guard import ResourceError
+
+
 class _UpstreamError(RuntimeError):
     def __init__(self, status: int, detail: str):
         super().__init__(detail)
@@ -431,6 +434,11 @@ def simulation_run(pid: str):
         payload = _call('POST', '/api/simulation/start', json_body=start_body)
     except _UpstreamError as exc:
         return _error(exc.status, str(exc))
+    except ResourceError as exc:
+        # 503, not 502: this is our own capacity limit, and SlashMarketer treats
+        # 503 as TRANSIENT — it will back off and retry, which is exactly right
+        # for "the host is busy, wait your turn" rather than "the engine broke".
+        return jsonify({'detail': str(exc)}), 503
     except RuntimeError as exc:
         return jsonify({'detail': str(exc)}), 502
     if force:

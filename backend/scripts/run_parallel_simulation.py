@@ -155,7 +155,7 @@ def init_logging_for_simulation(simulation_dir: str):
         shutil.rmtree(old_log_dir, ignore_errors=True)
 
 
-from action_logger import SimulationLogManager, PlatformActionLogger
+from action_logger import SimulationLogManager, PlatformActionLogger, last_completed_round
 
 try:
     from camel.models import ModelFactory
@@ -1149,8 +1149,17 @@ async def run_twitter_simulation(
         if agent_id not in agent_names:
             agent_names[agent_id] = getattr(agent, 'name', f'Agent_{agent_id}')
 
+    # Resume point, computed BEFORE the platform DB is touched. `force` on the
+    # engine side only decides whether THIS script is launched; the script then
+    # decided to start clean regardless, so a resumed run kept its round counter
+    # but lost every agent's memory — internally inconsistent, and worse than
+    # either starting fresh or genuinely continuing.
+    resume_from = last_completed_round(action_logger.log_path) if action_logger else 0
+
     db_path = os.path.join(simulation_dir, "twitter_simulation.db")
-    if os.path.exists(db_path):
+    if resume_from == 0 and os.path.exists(db_path):
+        # Only a fresh run starts from an empty platform DB: OASIS recreates each
+        # agent (persona + memory) from it, so this is the state we resume onto.
         os.remove(db_path)
 
     result.env = oasis.make(
@@ -1223,10 +1232,22 @@ async def run_twitter_simulation(
         total_rounds = min(total_rounds, max_rounds)
         if total_rounds < original_rounds:
             log_info(f"Rounds truncated: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
-    
+
+    # RESUME a previous, failed run instead of replaying it. The action log
+    # records every completed round, and `round_num` drives the simulated clock
+    # (and which agents are awake), so restarting at 0 would both waste the work
+    # already done and re-simulate the same simulated hours. Agent memory
+    # survives the restart in the platform DB as long as the run was not
+    # force-restarted (force deletes that DB).
+    if resume_from > 0:
+        log_info(
+            f"Resuming at round {resume_from + 1}/{total_rounds} "
+            f"({resume_from} round(s) already completed; agent memory retained)"
+        )
+
     start_time = datetime.now()
-    
-    for round_num in range(total_rounds):
+
+    for round_num in range(resume_from, total_rounds):
         # Check if shutdown signal was received
         if _shutdown_event and _shutdown_event.is_set():
             if main_logger:
@@ -1340,8 +1361,17 @@ async def run_reddit_simulation(
         if agent_id not in agent_names:
             agent_names[agent_id] = getattr(agent, 'name', f'Agent_{agent_id}')
 
+    # Resume point, computed BEFORE the platform DB is touched. `force` on the
+    # engine side only decides whether THIS script is launched; the script then
+    # decided to start clean regardless, so a resumed run kept its round counter
+    # but lost every agent's memory — internally inconsistent, and worse than
+    # either starting fresh or genuinely continuing.
+    resume_from = last_completed_round(action_logger.log_path) if action_logger else 0
+
     db_path = os.path.join(simulation_dir, "reddit_simulation.db")
-    if os.path.exists(db_path):
+    if resume_from == 0 and os.path.exists(db_path):
+        # Only a fresh run starts from an empty platform DB: OASIS recreates each
+        # agent (persona + memory) from it, so this is the state we resume onto.
         os.remove(db_path)
 
     result.env = oasis.make(
@@ -1422,10 +1452,22 @@ async def run_reddit_simulation(
         total_rounds = min(total_rounds, max_rounds)
         if total_rounds < original_rounds:
             log_info(f"Rounds truncated: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
-    
+
+    # RESUME a previous, failed run instead of replaying it. The action log
+    # records every completed round, and `round_num` drives the simulated clock
+    # (and which agents are awake), so restarting at 0 would both waste the work
+    # already done and re-simulate the same simulated hours. Agent memory
+    # survives the restart in the platform DB as long as the run was not
+    # force-restarted (force deletes that DB).
+    if resume_from > 0:
+        log_info(
+            f"Resuming at round {resume_from + 1}/{total_rounds} "
+            f"({resume_from} round(s) already completed; agent memory retained)"
+        )
+
     start_time = datetime.now()
-    
-    for round_num in range(total_rounds):
+
+    for round_num in range(resume_from, total_rounds):
         # Check if shutdown signal was received
         if _shutdown_event and _shutdown_event.is_set():
             if main_logger:

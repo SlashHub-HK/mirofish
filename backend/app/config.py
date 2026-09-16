@@ -54,6 +54,29 @@ class Config:
     # Graph database config (KuzuDB - local embedded graph database)
     GRAPH_DB_PATH = os.environ.get('GRAPH_DB_PATH', os.path.join(os.path.dirname(__file__), '../data/graphdb'))
 
+    # ── Kuzu (embedded graph DB) memory limits ──────────────────────────
+    # Kuzu defaults its buffer pool to ~80% of TOTAL PHYSICAL RAM and — per its
+    # own docs — "in a container, an explicit value is safer because that
+    # calculation does not explicitly inspect the cgroup limit". On a shared
+    # 24 GB host that is ~19 GB PER kuzu.Database instance, and one used to be
+    # constructed per query. These caps are per database object; the pool is a
+    # ceiling, not a preallocation, so small graphs still cost little.
+    KUZU_BUFFER_POOL_MB = int(os.environ.get('KUZU_BUFFER_POOL_MB', '256'))
+    # Kuzu otherwise uses every core; a graph scan that fans out across all of
+    # them multiplies transient working memory inside the pool.
+    KUZU_MAX_NUM_THREADS = int(os.environ.get('KUZU_MAX_NUM_THREADS', '4'))
+
+    # ── Host-resource guards (see core/resource_guard.py) ───────────────
+    # This service shares a 24 GB host. Refuse heavy work below this much free
+    # memory instead of letting the OOM-killer take out the container.
+    # 0 disables the check.
+    MIROFISH_MIN_FREE_MB = int(os.environ.get('MIROFISH_MIN_FREE_MB', '800'))
+    # In-process heavy stages (prepare/report) allowed at once.
+    MAX_CONCURRENT_HEAVY_STAGES = int(os.environ.get('MAX_CONCURRENT_HEAVY_STAGES', '1'))
+    # Simulation subprocesses allowed at once. One: a run holds a full OASIS
+    # agent stack (plus TWHIN-BERT for Twitter), which the host cannot duplicate.
+    MAX_CONCURRENT_SIMULATIONS = int(os.environ.get('MAX_CONCURRENT_SIMULATIONS', '1'))
+
     # File upload config (env-overridable so PaaS can point it at a volume)
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
     UPLOAD_FOLDER = os.environ.get(

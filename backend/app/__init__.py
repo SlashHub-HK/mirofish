@@ -17,6 +17,27 @@ from .config import Config
 from .utils.logger import setup_logger, get_logger
 
 
+def _capacity_snapshot() -> dict:
+    """Best-effort memory/concurrency state. Never raises."""
+    try:
+        from .core.resource_guard import available_memory_mb, heavy_stages_active
+        from .services.graph_db import open_database_count
+        from .services.simulation_runner import SimulationRunner
+
+        return {
+            'available_mb': available_memory_mb(),
+            'min_free_mb': Config.MIROFISH_MIN_FREE_MB,
+            'heavy_stages_active': heavy_stages_active(),
+            'max_heavy_stages': Config.MAX_CONCURRENT_HEAVY_STAGES,
+            'running_simulations': SimulationRunner.running_simulation_count(),
+            'max_simulations': Config.MAX_CONCURRENT_SIMULATIONS,
+            'kuzu_pools_open': open_database_count(),
+            'kuzu_buffer_pool_mb': Config.KUZU_BUFFER_POOL_MB,
+        }
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never break /health
+        return {'error': str(exc)[:160]}
+
+
 def create_app(config_class=Config):
     """Flask application factory function (headless API — no frontend)."""
     # Backend-only service: SlashMarketer owns the UI and calls this API.
@@ -102,7 +123,17 @@ def create_app(config_class=Config):
     # Health check (unauthenticated — used by the platform + SlashMarketer).
     @app.route('/health')
     def health():
-        return {'status': 'ok', 'service': 'MiroFish Backend', 'mode': 'headless'}
+        # Reports the commit so a deploy is verifiable from outside, plus a
+        # capacity snapshot: when a run is refused for lack of headroom, this is
+        # where an operator can see *why*. Wrapped so /health can never fail or
+        # slow down — the platform polls it, and Railway health-checks it.
+        return {
+            'status': 'ok',
+            'service': 'MiroFish Backend',
+            'mode': 'headless',
+            'commit': (os.environ.get('RAILWAY_GIT_COMMIT_SHA') or '')[:12] or None,
+            'capacity': _capacity_snapshot(),
+        }
 
     # Service metadata.
     @app.route('/')
@@ -114,6 +145,15 @@ def create_app(config_class=Config):
             'endpoints': ['/health', '/api/projects/*', '/api/graph/*', '/api/simulation/*', '/api/report/*'],
             'routes': sorted(str(r) for r in app.url_map.iter_rules() if str(r).startswith('/api/')),
         }
+
+    # Release the cached Kuzu database handles on exit. Each one owns a buffer
+    # pool (see services/graph_db.py), so leaving them to the OS means a
+    # restart/rolling deploy can briefly hold two full sets of pools.
+    import atexit
+
+    from .services.graph_db import close_all_databases
+
+    atexit.register(close_all_databases)
 
     if should_log_startup:
         logger.info("MiroFish Backend started successfully (headless API)")

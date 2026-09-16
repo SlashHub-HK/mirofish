@@ -19,9 +19,43 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 
 
+def last_completed_round(log_path: str) -> int:
+    """Highest round number that finished, from an existing action log.
+
+    Used to RESUME a failed run instead of replaying it: the simulation loop is
+    driven by `round_num` (it maps to the simulated clock and to which agents are
+    active), so restarting at 0 both wastes the completed work and re-simulates
+    the same simulated hours twice.
+
+    Streams the file line by line — the log grows with every action of every
+    agent, so it must never be read whole. Returns 0 when the log is missing,
+    empty, or unreadable, which is the correct "start from the beginning".
+    """
+    if not log_path or not os.path.exists(log_path):
+        return 0
+    highest = 0
+    try:
+        with open(log_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if '"round_end"' not in line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if entry.get('event_type') != 'round_end':
+                    continue
+                try:
+                    highest = max(highest, int(entry.get('round') or 0))
+                except (ValueError, TypeError):
+                    continue
+    except OSError:
+        return 0
+    return highest
+
+
 class PlatformActionLogger:
     """Single-platform action logger"""
-
     def __init__(self, platform: str, base_dir: str):
         """
         Initialize the logger.

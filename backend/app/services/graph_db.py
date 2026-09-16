@@ -7,6 +7,7 @@ Provides node/edge CRUD, search, and graph management.
 import json
 import os
 import shutil
+import threading
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -21,6 +22,81 @@ except ImportError:  # pragma: no cover - dependency availability is environment
     kuzu = None
 
 logger = get_logger('mirofish.graph_db')
+
+
+# ── Kuzu database handles: open ONCE per graph, with a bounded pool ────
+#
+# `kuzu.Database` used to be constructed inside `_connect()`, i.e. on EVERY
+# query, and never closed. Two consequences, both severe:
+#
+#   1. Kuzu sizes each instance's buffer pool to ~80% of TOTAL physical RAM
+#      (and, per Kuzu's docs, does NOT read the container's cgroup limit), so on
+#      a shared 24 GB host every handle was entitled to ~19 GB. During prepare
+#      the profile generator issues ~2 searches per entity, each loading all
+#      nodes AND all edges — so a 40-entity run opened on the order of a hundred
+#      such handles. That is the 6 GB peak.
+#   2. Nothing was ever released, so memory grew with each run until restart.
+#
+# A Database is the expensive, memory-owning object; a Connection is cheap and
+# is the unit that must not be shared across threads. So we cache one bounded
+# Database per directory and keep creating a fresh Connection per call, which
+# preserves the previous thread-safety model.
+_DB_LOCK = threading.Lock()
+_DATABASES: Dict[str, Any] = {}
+
+
+def _buffer_pool_bytes() -> int:
+    return max(1, int(Config.KUZU_BUFFER_POOL_MB)) * 1024 * 1024
+
+
+def _open_database(db_dir: str):
+    """Return a shared, memory-capped `kuzu.Database` for ``db_dir``."""
+    with _DB_LOCK:
+        existing = _DATABASES.get(db_dir)
+        if existing is not None:
+            return existing
+        db = kuzu.Database(
+            db_dir,
+            buffer_pool_size=_buffer_pool_bytes(),
+            max_num_threads=max(1, int(Config.KUZU_MAX_NUM_THREADS)),
+        )
+        _DATABASES[db_dir] = db
+        logger.info(
+            f"Opened Kuzu database {db_dir} "
+            f"(buffer_pool={Config.KUZU_BUFFER_POOL_MB}MB, "
+            f"threads={Config.KUZU_MAX_NUM_THREADS}, open={len(_DATABASES)})"
+        )
+        return db
+
+
+def _close_database(db_dir: str) -> bool:
+    """Close and evict a cached database so the graph can be deleted/replaced."""
+    with _DB_LOCK:
+        db = _DATABASES.pop(db_dir, None)
+    if db is None:
+        return False
+    try:
+        db.close()
+    except Exception as exc:  # noqa: BLE001 - close is best-effort
+        logger.warning(f"Closing Kuzu database {db_dir} failed: {exc}")
+    return True
+
+
+def open_database_count() -> int:
+    """How many Kuzu database pools this process currently holds open.
+
+    Exposed on /health so a capacity problem is visible rather than inferred
+    from RSS: each open pool owns a buffer pool (KUZU_BUFFER_POOL_MB).
+    """
+    with _DB_LOCK:
+        return len(_DATABASES)
+
+
+def close_all_databases() -> int:
+    """Close every cached database (process shutdown / tests)."""
+    with _DB_LOCK:
+        dirs = list(_DATABASES)
+    return sum(1 for d in dirs if _close_database(d))
 
 
 @dataclass
@@ -149,7 +225,7 @@ class GraphDatabase:
             return
 
         logger.info(f"Migrating legacy JSON graph to KuzuDB: {graph_id}")
-        conn = kuzu.Connection(kuzu.Database(db_dir))
+        conn = kuzu.Connection(_open_database(db_dir))
         self._initialize_schema(conn)
 
         legacy_nodes = self._load_json(self._legacy_nodes_file(graph_id), default=[])
@@ -221,8 +297,8 @@ class GraphDatabase:
             self._migrate_legacy_json_graph(graph_id)
         if not os.path.exists(db_dir):
             raise FileNotFoundError(f"Graph database not found: {graph_id}")
-        db = kuzu.Database(db_dir)
-        conn = kuzu.Connection(db)
+        # Shared, memory-capped Database + a fresh cheap Connection per call.
+        conn = kuzu.Connection(_open_database(db_dir))
         return conn
 
     def _initialize_schema(self, conn):
@@ -300,7 +376,10 @@ class GraphDatabase:
         db_dir = self._db_dir(graph_id)
         os.makedirs(graph_dir, exist_ok=True)
 
-        conn = kuzu.Connection(kuzu.Database(db_dir))
+        # A graph may be recreated in place; drop any cached handle first so we
+        # never keep a pool pointed at a directory we are about to write over.
+        _close_database(db_dir)
+        conn = kuzu.Connection(_open_database(db_dir))
         self._initialize_schema(conn)
 
         meta = {
@@ -318,6 +397,10 @@ class GraphDatabase:
     def delete_graph(self, graph_id: str):
         """Delete a graph and all its data"""
         graph_dir = self._graph_dir(graph_id)
+        # Release the cached handle first: without this the pool for a deleted
+        # graph stays resident for the life of the process (and on platforms
+        # that lock open files the rmtree itself can fail).
+        _close_database(self._db_dir(graph_id))
         if os.path.exists(graph_dir):
             shutil.rmtree(graph_dir)
             logger.info(f"Deleted graph: {graph_id}")
@@ -616,50 +699,76 @@ class GraphDatabase:
         """
         Text search across graph nodes and/or edges.
         Matches query terms against names, summaries, facts, and attributes.
+
+        Filtering happens IN KUZU, not in Python. This used to call
+        `get_all_edges` + `get_all_nodes` and score every row in memory; the
+        profile generator searches once per entity while preparing a run, so on
+        a modest graph that meant loading the entire graph dozens of times over.
+        A row that matches no term scores 0 and can never reach the top `limit`,
+        so filtering to rows matching at least one term is behaviour-preserving.
         """
         query_lower = query.lower().strip()
-        query_terms = query_lower.split()
-        results = []
+        query_terms = [t for t in query_lower.split() if t]
+        if not query_terms:
+            return []
+        results: List[Dict[str, Any]] = []
+        # Kuzu raises on an UNUSED named parameter, so only `terms` is
+        # bound here; `limit` is applied to the scored rows below.
+        params = {"terms": query_terms}
 
         if scope in ("edges", "both"):
-            edges = self.get_all_edges(graph_id)
-            nodes = self.get_all_nodes(graph_id)
-            node_map = {n.uuid_: n.name for n in nodes}
-
-            for e in edges:
-                text = f"{e.name} {e.fact}".lower()
+            conn = self._connect(graph_id)
+            rows = conn.execute(
+                """
+                MATCH (a:Node)-[e:Edge]->(b:Node)
+                WHERE any(term IN $terms WHERE contains(lower(concat(e.name, ' ', e.fact)), term))
+                RETURN e.uuid, e.name, e.fact, a.uuid, a.name, b.uuid, b.name
+                """,
+                params,
+            ).get_all()
+            for uuid_, name, fact, source_uuid, source_name, target_uuid, target_name in rows:
+                text = f"{name} {fact}".lower()
                 score = sum(1 for term in query_terms if term in text)
                 if score > 0:
                     results.append({
                         "type": "edge",
-                        "uuid": e.uuid_,
-                        "name": e.name,
-                        "fact": e.fact,
-                        "source_node_uuid": e.source_node_uuid,
-                        "target_node_uuid": e.target_node_uuid,
-                        "source_node_name": node_map.get(e.source_node_uuid, ""),
-                        "target_node_name": node_map.get(e.target_node_uuid, ""),
-                        "score": score / len(query_terms) if query_terms else 0,
+                        "uuid": uuid_,
+                        "name": name,
+                        "fact": fact,
+                        "source_node_uuid": source_uuid,
+                        "target_node_uuid": target_uuid,
+                        "source_node_name": source_name,
+                        "target_node_name": target_name,
+                        "score": score / len(query_terms),
                     })
 
         if scope in ("nodes", "both"):
-            nodes = self.get_all_nodes(graph_id)
-            for n in nodes:
-                text = f"{n.name} {n.summary}".lower()
-                attrs_text = json.dumps(n.attributes, ensure_ascii=False).lower()
+            conn = self._connect(graph_id)
+            rows = conn.execute(
+                """
+                MATCH (n:Node)
+                WHERE any(term IN $terms WHERE contains(lower(concat(n.name, ' ', n.summary)), term)
+                                            OR contains(lower(n.attributes), term))
+                RETURN n.uuid, n.name, n.labels, n.summary, n.attributes
+                """,
+                params,
+            ).get_all()
+            for uuid_, name, labels, summary, attributes in rows:
+                text = f"{name} {summary}".lower()
+                attrs_text = str(attributes or "").lower()
                 score = sum(1 for term in query_terms if term in text or term in attrs_text)
                 if score > 0:
                     results.append({
                         "type": "node",
-                        "uuid": n.uuid_,
-                        "name": n.name,
-                        "labels": n.labels,
-                        "summary": n.summary,
-                        "score": score / len(query_terms) if query_terms else 0,
+                        "uuid": uuid_,
+                        "name": name,
+                        "labels": labels,
+                        "summary": summary,
+                        "score": score / len(query_terms),
                     })
 
         results.sort(key=lambda x: x["score"], reverse=True)
-        return results[:limit]
+        return results[: int(limit)]
 
     # ========== Graph Data Export ==========
 

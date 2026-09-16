@@ -13,6 +13,7 @@ from ..services.report_agent import ReportAgent, ReportStatus
 from ..utils.logger import get_logger
 
 logger = get_logger("mirofish.tools.generate_report")
+from ..core.resource_guard import assert_memory_available, heavy_stage
 
 
 class GenerateReportTool:
@@ -120,7 +121,13 @@ class GenerateReportTool:
                         message=f"[{stage}] {message}",
                     )
 
-                report = agent.generate_report(progress_callback=progress_callback, report_id=report_id)
+                # The report agent holds the whole transcript + section drafts in
+                # memory, so serialise it and refuse when the host is short.
+                assert_memory_available('report generation')
+                with heavy_stage('report generation'):
+                    report = agent.generate_report(
+                        progress_callback=progress_callback, report_id=report_id
+                    )
                 self.report_store.save(report)
 
                 if report.status == ReportStatus.COMPLETED:

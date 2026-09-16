@@ -2,11 +2,16 @@
 
 from typing import Any, Dict, Optional
 
+from ..core.resource_guard import (
+    assert_memory_available,
+    assert_simulation_slot,
+)
 from ..core.session_manager import SessionManager
 from ..models.project import ProjectManager
 from ..resources.projects import ProjectStore
 from ..resources.simulations import SimulationRuntime, SimulationStore
 from ..services.simulation_manager import SimulationStatus
+from ..services.simulation_runner import SimulationRunner
 from ..utils.logger import get_logger
 from .simulation_support import check_simulation_prepared
 
@@ -106,6 +111,13 @@ class RunSimulationTool:
                 raise ValueError(
                     "Enabling graph memory update requires a valid graph_id. Please ensure the project graph has been built"
                 )
+
+        # Host-resource guards. This service shares a 24 GB box and a running
+        # simulation holds a full OASIS agent stack (plus TWHIN-BERT for
+        # Twitter), so refusing here with a clear message beats letting the
+        # kernel OOM-kill the container and take every other request with it.
+        assert_memory_available('the simulation')
+        assert_simulation_slot(SimulationRunner.running_simulation_count())
 
         run_state = self.simulation_runtime.start(
             simulation_id=simulation_id,
